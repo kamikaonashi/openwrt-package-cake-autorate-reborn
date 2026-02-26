@@ -106,3 +106,12 @@ License
 This project is released under the MIT License.
 
 The original cake-autorate project is licensed under its own terms. Please see the upstream repository for details.
+
+
+Screenshots
+<img width="3343" height="1318" alt="Screenshot From 2026-02-26 17-26-41" src="https://github.com/user-attachments/assets/2dde3238-859f-4f90-86a1-b57384f253cf" />
+<img width="3343" height="1318" alt="Screenshot From 2026-02-26 17-26-46" src="https://github.com/user-attachments/assets/d9149822-3a21-4f3c-ab15-c09b0a83507b" />
+<img width="3343" height="1318" alt="Screenshot From 2026-02-26 17-26-54" src="https://github.com/user-attachments/assets/132e7d98-eaa3-4a2b-aaf8-70e37d1d5bab" />
+<img width="3343" height="1318" alt="Screenshot From 2026-02-26 17-26-59" src="https://github.com/user-attachments/assets/626c132d-e15a-48b2-850f-38aadf523412" />
+<img width="3343" height="1318" alt="Screenshot From 2026-02-26 17-27-04" src="https://github.com/user-attachments/assets/59adcf63-c6e1-4805-975c-619120fd4bf1" />
+
