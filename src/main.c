@@ -2,7 +2,7 @@
  * cake-autorate – C rewrite for OpenWrt
  *
  * Core algorithm mirrors cake-autorate.sh:
- *   • ICMP ping via fping child process (non-blocking read on pipe)
+ *   • ICMP ping via custom pinger
  *   • Rate monitor via /sys/class/net polling
  *   • tc qdisc change for CAKE bandwidth adjustment (fork+exec, no shell)
  *   • uloop for the main event loop, timers, and fd watching
@@ -21,6 +21,11 @@
 #include <time.h>
 #include <math.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/ip_icmp.h>
 
 #include <libubox/uloop.h>
 
@@ -51,6 +56,7 @@
 /* ────────────────────────────────────────────────────────────── */
 typedef struct {
     char    addr[64];
+    uint32_t addr_be;
     int64_t dl_owd_baseline_us;
     int64_t ul_owd_baseline_us;
     int64_t dl_owd_delta_ewma_us;
@@ -102,19 +108,17 @@ typedef struct {
     int64_t     t_last_reflector_health_us;
     int64_t     global_last_response_us;
 
-    /* Pingers (fping child) */
-    pid_t             pinger_pid;
-    int               pinger_fd;
-    struct uloop_fd   pinger_ufd;
-
-    /* Line reassembly buffer (was global static – now per-instance) */
-    char line_buf[512];
-    int  line_len;
+    /* Integrated ICMP pinger (IPv4 raw socket) */
+    int               icmp_sock;
+    struct uloop_fd   icmp_ufd;
+    struct uloop_timeout ping_timer;
+    uint16_t          ping_id;
+    uint16_t          ping_seq;
+    int               ping_rr_idx;  /* round-robin reflector index */
 
     /* Timers */
     struct uloop_timeout rate_timer;
     struct uloop_timeout health_timer;
-    struct uloop_timeout restart_timer;  /* delayed fping restart */
 
     /* State machine */
     int main_state;
@@ -432,198 +436,229 @@ static void process_owd(autorate_t *ar,
 }
 
 /* ────────────────────────────────────────────────────────────── */
-/*  fping output parser                                           */
-/*                                                                */
-/*  fping --timestamp --loop output (modern, default):            */
-/*    [epoch.frac] addr : [seq], N bytes, rtt ms (avg ms, loss%)  */
-/*                                                                */
-/*  Older / minimal builds omit the "N bytes" field:              */
-/*    [epoch.frac] addr : [seq] rtt ms                            */
-/*                                                                */
-/*  Timeout lines (skipped):                                      */
-/*    [epoch.frac] addr : [seq], timed out                        */
-/*                                                                */
-/*  We use RTT/2 as a proxy for both DL and UL OWD since fping    */
-/*  only gives round-trip time.                                   */
+/*  Integrated ICMPv4 pinger (raw socket)                          */
 /* ────────────────────────────────────────────────────────────── */
-static void parse_fping_line(autorate_t *ar, const char *line)
+
+#define PING_PAYLOAD_MAGIC 0xCACEB00Bu
+
+static uint16_t csum16(const void *data, size_t len)
 {
-    double ts, rtt_ms;
-    char   addr[64];
-    int    seq;
+    const uint8_t *p = (const uint8_t *)data;
+    uint32_t sum = 0;
 
-    /*
-     * Try modern format first: "[ts] addr : [seq], N bytes, rtt ms ..."
-     * The %*d skips byte count, %*s skips the word "bytes,".
-     */
-    if (sscanf(line, "[%lf] %63s : [%d], %*d %*s %lf ms",
-               &ts, addr, &seq, &rtt_ms) != 4) {
-        /* Fallback: "[ts] addr : [seq] rtt ms" (no bytes field) */
-        if (sscanf(line, "[%lf] %63s : [%d] %lf ms",
-                   &ts, addr, &seq, &rtt_ms) != 4)
-            return; /* timeout or unrecognised line – skip silently */
+    while (len > 1) {
+        sum += (uint16_t)((p[0] << 8) | p[1]);
+        p += 2;
+        len -= 2;
     }
+    if (len == 1)
+        sum += (uint16_t)(p[0] << 8);
 
-    /* Locate the reflector in our active set */
-    int ridx = -1;
-    for (int i = 0; i < ar->no_active_reflectors; i++) {
-        if (strcmp(ar->reflectors[i].addr, addr) == 0) {
-            ridx = i;
-            break;
-        }
-    }
-    if (ridx < 0) return;
-
-    int64_t t_now  = now_us();
-    int64_t owd_us = (int64_t)(rtt_ms * 500.0); /* RTT/2 → µs */
-    process_owd(ar, ridx, owd_us, owd_us, t_now);
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
+    return (uint16_t)~sum;
 }
 
-/* ────────────────────────────────────────────────────────────── */
-/*  fping lifecycle                                               */
-/* ────────────────────────────────────────────────────────────── */
-static void pinger_cb(struct uloop_fd *ufd, unsigned int events);
-static void restart_fping_cb(struct uloop_timeout *t);
-
-static int start_fping(autorate_t *ar)
+static void write_be64(uint8_t out[8], uint64_t v)
 {
+    out[0] = (uint8_t)(v >> 56);
+    out[1] = (uint8_t)(v >> 48);
+    out[2] = (uint8_t)(v >> 40);
+    out[3] = (uint8_t)(v >> 32);
+    out[4] = (uint8_t)(v >> 24);
+    out[5] = (uint8_t)(v >> 16);
+    out[6] = (uint8_t)(v >> 8);
+    out[7] = (uint8_t)(v);
+}
+
+static uint64_t read_be64(const uint8_t in[8])
+{
+    return ((uint64_t)in[0] << 56) |
+           ((uint64_t)in[1] << 48) |
+           ((uint64_t)in[2] << 40) |
+           ((uint64_t)in[3] << 32) |
+           ((uint64_t)in[4] << 24) |
+           ((uint64_t)in[5] << 16) |
+           ((uint64_t)in[6] << 8)  |
+           ((uint64_t)in[7]);
+}
+
+struct ping_payload {
+    uint32_t magic_be;
+    uint16_t ridx_be;     /* reflector index (debug/sanity), optional */
+    uint16_t reserved_be;
+    uint8_t  t_sent_be64[8]; /* int64_t timestamp in us, big-endian */
+} __attribute__((packed));
+
+static void icmp_reply_cb(struct uloop_fd *ufd, unsigned int events)
+{
+    (void)events;
+    autorate_t *ar = container_of(ufd, autorate_t, icmp_ufd);
+
+    for (;;) {
+        uint8_t buf[512];
+        struct sockaddr_in src;
+        socklen_t slen = sizeof(src);
+
+        ssize_t n = recvfrom(ufd->fd, buf, sizeof(buf), 0,
+                             (struct sockaddr *)&src, &slen);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return;
+            return;
+        }
+        if ((size_t)n < sizeof(struct iphdr))
+            continue;
+
+        struct iphdr *iph = (struct iphdr *)buf;
+        int ip_hlen = iph->ihl * 4;
+        if (ip_hlen < 20 || (size_t)n < (size_t)ip_hlen + sizeof(struct icmphdr))
+            continue;
+
+        struct icmphdr *icmph = (struct icmphdr *)(buf + ip_hlen);
+
+        if (icmph->type != ICMP_ECHOREPLY)
+            continue;
+
+        if (ntohs(icmph->un.echo.id) != ar->ping_id)
+            continue;
+
+        const uint8_t *payload = (const uint8_t *)(icmph + 1);
+        size_t payload_len = (size_t)n - (size_t)ip_hlen - sizeof(struct icmphdr);
+        if (payload_len < sizeof(struct ping_payload))
+            continue;
+
+        const struct ping_payload *pl = (const struct ping_payload *)payload;
+        if (pl->magic_be != htonl(PING_PAYLOAD_MAGIC))
+            continue;
+
+        uint32_t src_be = src.sin_addr.s_addr;
+
+        int ridx = -1;
+        for (int i = 0; i < ar->no_active_reflectors; i++) {
+            if (ar->reflectors[i].addr_be == src_be) {
+                ridx = i;
+                break;
+            }
+        }
+        if (ridx < 0)
+            continue;
+
+        int64_t t_now_us = now_us();
+        int64_t t_sent_us = (int64_t)read_be64(pl->t_sent_be64);
+        int64_t rtt_us = t_now_us - t_sent_us;
+        if (rtt_us <= 0)
+            continue;
+
+        int64_t owd_us = rtt_us / 2;
+        process_owd(ar, ridx, owd_us, owd_us, t_now_us);
+    }
+}
+
+static void ping_timer_cb(struct uloop_timeout *t)
+{
+    autorate_t *ar = container_of(t, autorate_t, ping_timer);
     cake_config_t *c = &ar->cfg;
-    int pipefd[2];
-    if (pipe(pipefd) < 0) return -1;
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pipefd[0]);
-        close(pipefd[1]);
+    if (ar->no_active_reflectors <= 0 || ar->icmp_sock < 0) {
+        uloop_timeout_set(&ar->ping_timer, 1000);
+        return;
+    }
+
+    if (ar->ping_rr_idx >= ar->no_active_reflectors)
+        ar->ping_rr_idx = 0;
+
+    int ridx = ar->ping_rr_idx++;
+    reflector_t *r = &ar->reflectors[ridx];
+
+    if (r->addr_be == 0) {
+        /* skip invalid address */
+        goto out;
+    }
+
+    struct sockaddr_in dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_addr.s_addr = r->addr_be;
+
+    uint8_t pkt[sizeof(struct icmphdr) + sizeof(struct ping_payload)];
+    memset(pkt, 0, sizeof(pkt));
+
+    struct icmphdr *icmph = (struct icmphdr *)pkt;
+    struct ping_payload *pl = (struct ping_payload *)(icmph + 1);
+
+    icmph->type = ICMP_ECHO;
+    icmph->code = 0;
+    icmph->un.echo.id = htons(ar->ping_id);
+    icmph->un.echo.sequence = htons(++ar->ping_seq);
+
+    pl->magic_be = htonl(PING_PAYLOAD_MAGIC);
+    pl->ridx_be  = htons((uint16_t)ridx);
+    pl->reserved_be = 0;
+
+    int64_t t_sent_us = now_us();
+    write_be64(pl->t_sent_be64, (uint64_t)t_sent_us);
+
+    icmph->checksum = 0;
+    icmph->checksum = csum16(pkt, sizeof(pkt));
+
+    (void)sendto(ar->icmp_sock, pkt, sizeof(pkt), 0,
+                 (struct sockaddr *)&dst, sizeof(dst));
+
+out:
+    /* Calculate the interval between individual pings to maintain the global rate */
+    int interval_ms = (int)((c->reflector_ping_interval_s * 1000.0) / ar->no_active_reflectors);
+    if (interval_ms < 10) interval_ms = 10; /* minimum 10ms */
+    uloop_timeout_set(&ar->ping_timer, interval_ms);
+}
+
+static void refresh_reflector_addrs(autorate_t *ar)
+{
+    for (int i = 0; i < ar->no_active_reflectors; i++) {
+        struct in_addr a;
+        if (inet_pton(AF_INET, ar->reflectors[i].addr, &a) == 1)
+            ar->reflectors[i].addr_be = a.s_addr;
+        else
+            ar->reflectors[i].addr_be = 0;
+    }
+}
+
+static int start_pinger(autorate_t *ar)
+{
+    ar->icmp_sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (ar->icmp_sock < 0)
         return -1;
-    }
 
-    if (pid == 0) {
-        /* child: wire pipe write-end to both stdout and stderr */
-        close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
-        dup2(pipefd[1], STDERR_FILENO);
-        close(pipefd[1]);
+    set_nonblocking(ar->icmp_sock);
 
-        /*
-         * fping -D --loop --period <ms_total> --interval <ms_each>
-         *       --timeout 10000 <reflectors…>
-         *
-         * period = interval * no_pingers  → each host gets pinged
-         *   every reflector_ping_interval_s seconds.
-         */
-        int interval_ms = (int)(c->reflector_ping_interval_s * 1000.0);
-        int period_ms   = interval_ms * c->no_pingers;
-        if (period_ms < interval_ms) period_ms = interval_ms;
+    ar->icmp_ufd.fd = ar->icmp_sock;
+    ar->icmp_ufd.cb = icmp_reply_cb;
+    uloop_fd_add(&ar->icmp_ufd, ULOOP_READ | ULOOP_EDGE_TRIGGER);
 
-        char period_s[16], interval_s[16];
-        snprintf(period_s,   sizeof(period_s),   "%d", period_ms);
-        snprintf(interval_s, sizeof(interval_s), "%d", interval_ms);
+    ar->ping_id = (uint16_t)(getpid() & 0xFFFF);
+    ar->ping_seq = 0;
+    ar->ping_rr_idx = 0;
 
-        /* argv: fixed args + active reflectors + NULL */
-        int n_fixed = 9;
-        const char **argv = calloc((size_t)(n_fixed + ar->no_active_reflectors + 1),
-                                   sizeof(char *));
-        if (!argv) _exit(1);
+    refresh_reflector_addrs(ar);
 
-        int a = 0;
-        argv[a++] = "/usr/bin/fping";
-        argv[a++] = "--timestamp";
-        argv[a++] = "--loop";
-        argv[a++] = "--period";    argv[a++] = period_s;
-        argv[a++] = "--interval";  argv[a++] = interval_s;
-        argv[a++] = "--timeout";   argv[a++] = "10000";
-        for (int i = 0; i < ar->no_active_reflectors; i++)
-            argv[a++] = ar->reflectors[i].addr;
-        argv[a] = NULL;
-
-        execv(argv[0], (char *const *)argv);
-        _exit(127);
-    }
-
-    /* parent */
-    close(pipefd[1]);
-    set_nonblocking(pipefd[0]);
-
-    ar->pinger_pid        = pid;
-    ar->pinger_fd         = pipefd[0];
-    ar->line_len          = 0;   /* reset line reassembly state */
-    ar->pinger_ufd.fd     = pipefd[0];
-    ar->pinger_ufd.cb     = pinger_cb;
-    uloop_fd_add(&ar->pinger_ufd, ULOOP_READ | ULOOP_EDGE_TRIGGER);
+    ar->ping_timer.cb = ping_timer_cb;
+    uloop_timeout_set(&ar->ping_timer, 1);
     return 0;
 }
 
-static void stop_fping(autorate_t *ar)
+static void stop_pinger(autorate_t *ar)
 {
-    if (ar->pinger_ufd.registered)
-        uloop_fd_delete(&ar->pinger_ufd);
-    if (ar->pinger_fd >= 0) {
-        close(ar->pinger_fd);
-        ar->pinger_fd = -1;
-    }
-    if (ar->pinger_pid > 0) {
-        kill(ar->pinger_pid, SIGTERM);
-        /* Reap with a brief spin so we don't block the event loop. */
-        for (int i = 0; i < 50; i++) {
-            if (waitpid(ar->pinger_pid, NULL, WNOHANG) > 0) break;
-            usleep(10000); /* 10 ms */
-        }
-        /* If still alive after 500 ms, SIGKILL and blocking wait. */
-        if (waitpid(ar->pinger_pid, NULL, WNOHANG) == 0) {
-            kill(ar->pinger_pid, SIGKILL);
-            waitpid(ar->pinger_pid, NULL, 0);
-        }
-        ar->pinger_pid = 0;
+    uloop_timeout_cancel(&ar->ping_timer);
+
+    if (ar->icmp_ufd.registered)
+        uloop_fd_delete(&ar->icmp_ufd);
+
+    if (ar->icmp_sock >= 0) {
+        close(ar->icmp_sock);
+        ar->icmp_sock = -1;
     }
 }
 
-/* Delayed restart callback – fires 1 s after an unexpected fping exit. */
-static void restart_fping_cb(struct uloop_timeout *t)
-{
-    autorate_t *ar = container_of(t, autorate_t, restart_timer);
-    syslog(LOG_INFO, "restarting fping");
-    if (start_fping(ar) < 0) {
-        syslog(LOG_ERR, "failed to restart fping, retrying in 5 s");
-        uloop_timeout_set(t, 5000);
-    }
-}
-
-/* uloop fd callback: data available from fping pipe */
-static void pinger_cb(struct uloop_fd *ufd, unsigned int events)
-{
-    autorate_t *ar = container_of(ufd, autorate_t, pinger_ufd);
-    char buf[512];
-    ssize_t n;
-
-    while ((n = read(ufd->fd, buf, sizeof(buf) - 1)) > 0) {
-        for (ssize_t i = 0; i < n; i++) {
-            if (buf[i] == '\n') {
-                ar->line_buf[ar->line_len] = '\0';
-                parse_fping_line(ar, ar->line_buf);
-                ar->line_len = 0;
-            } else if (ar->line_len < (int)sizeof(ar->line_buf) - 1) {
-                ar->line_buf[ar->line_len++] = buf[i];
-            }
-        }
-    }
-
-    if (ufd->eof) {
-        /* fping exited unexpectedly – clean up and schedule a restart. */
-        uloop_fd_delete(ufd);
-        close(ufd->fd);
-        ar->pinger_fd = -1;
-
-        /* Reap zombie without blocking. */
-        if (ar->pinger_pid > 0) {
-            waitpid(ar->pinger_pid, NULL, WNOHANG);
-            ar->pinger_pid = 0;
-        }
-
-        syslog(LOG_WARNING, "fping exited unexpectedly, restarting in 1 s");
-        uloop_timeout_set(&ar->restart_timer, 1000);
-    }
-}
 
 /* ────────────────────────────────────────────────────────────── */
 /*  Reflector health check timer                                  */
@@ -683,12 +718,7 @@ static void health_timer_cb(struct uloop_timeout *t)
     }
 
     if (replaced) {
-        /* Restart fping so it pings the updated reflector set. */
-        stop_fping(ar);
-        if (start_fping(ar) < 0) {
-            syslog(LOG_ERR, "failed to restart fping after reflector replacement");
-            uloop_timeout_set(&ar->restart_timer, 1000);
-        }
+        refresh_reflector_addrs(ar);
     }
 
     uloop_timeout_set(t, (int)(c->reflector_health_check_interval_us / 1000));
@@ -775,7 +805,6 @@ int main(int argc, char *argv[])
 
     autorate_t ar;
     memset(&ar, 0, sizeof(ar));
-    ar.pinger_fd = -1;
 
     if (config_load(section, &ar.cfg) < 0) {
         fprintf(stderr, "cake-autorate: failed to load UCI config '%s'\n",
@@ -849,11 +878,10 @@ int main(int argc, char *argv[])
     signal(SIGTERM, handle_signal);
     signal(SIGCHLD, SIG_DFL); /* ensure waitpid works normally */
 
-    /* Start fping */
-    if (start_fping(&ar) < 0) {
-        syslog(LOG_ERR, "failed to start fping");
+    /* Start integrated pinger */
+    if (start_pinger(&ar) < 0) {
+        syslog(LOG_ERR, "failed to start integrated pinger (raw ICMP)");
         rate_monitor_cleanup(&ar.rm);
-        tc_nl_close(ar.tc_nl); 
         return 1;
     }
 
@@ -867,9 +895,6 @@ int main(int argc, char *argv[])
     uloop_timeout_set(&ar.health_timer,
         (int)(ar.cfg.reflector_health_check_interval_us / 1000));
 
-    /* Restart timer (armed on demand, not here) */
-    ar.restart_timer.cb = restart_fping_cb;
-
     syslog(LOG_INFO, "started instance '%s' dl=%s ul=%s",
            section, ar.cfg.dl_if, ar.cfg.ul_if);
 
@@ -881,9 +906,8 @@ int main(int argc, char *argv[])
 
     uloop_timeout_cancel(&ar.rate_timer);
     uloop_timeout_cancel(&ar.health_timer);
-    uloop_timeout_cancel(&ar.restart_timer);
 
-    stop_fping(&ar);
+    stop_pinger(&ar);
 
     /* Restore unlimited bandwidth so the interface is not throttled
      * after we exit. */

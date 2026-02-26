@@ -61,7 +61,6 @@ void config_set_defaults(cake_config_t *cfg)
 
     snprintf(cfg->dl_if,  sizeof(cfg->dl_if),  "ifb-wan");
     snprintf(cfg->ul_if,  sizeof(cfg->ul_if),  "wan");
-    snprintf(cfg->pinger_method, sizeof(cfg->pinger_method), "fping");
 
     cfg->enabled                 = 0;
     cfg->adjust_dl_shaper_rate   = 1;
@@ -188,7 +187,6 @@ int config_load(const char *section_name, cake_config_t *cfg)
     UCI_U32(connection_active_thr_kbps, "connection_active_thr_kbps");
 
     /* Pinger */
-    UCI_STR(pinger_method,              "pinger_method");
     UCI_INT(no_pingers,                 "no_pingers");
     UCI_DBL(reflector_ping_interval_s,  "reflector_ping_interval_s");
 

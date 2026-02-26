@@ -106,12 +106,6 @@ return view.extend({
                 _('Connection Active Threshold (kbps)'), 2000);
 
             /* ── Advanced tab ─────────────────────────────── */
-            o = s.taboption('advanced', form.ListValue, 'pinger_method',
-                _('Pinger Method'),
-                _('Only <strong>fping</strong> is supported in this build.'));
-            o.value('fping', _('fping'));
-            o.default = 'fping';
-
             o = s.taboption('advanced', form.Value, 'no_pingers',
                 _('Number of Active Pingers'),
                 _('How many reflectors to ping concurrently.'));
