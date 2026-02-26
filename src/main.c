@@ -439,7 +439,7 @@ static void process_owd(autorate_t *ar,
 /*  Integrated ICMPv4 pinger (raw socket)                          */
 /* ────────────────────────────────────────────────────────────── */
 
-#define PING_PAYLOAD_MAGIC 0xCAKEB00Bu
+#define PING_PAYLOAD_MAGIC 0xCACEB00Bu
 
 static uint16_t csum16(const void *data, size_t len)
 {
@@ -606,8 +606,9 @@ static void ping_timer_cb(struct uloop_timeout *t)
                  (struct sockaddr *)&dst, sizeof(dst));
 
 out:
-    int interval_ms = (int)(c->reflector_ping_interval_s * 1000.0);
-    if (interval_ms < 10) interval_ms = 10; /* clamp */
+    /* Calculate the interval between individual pings to maintain the global rate */
+    int interval_ms = (int)((c->reflector_ping_interval_s * 1000.0) / ar->no_active_reflectors);
+    if (interval_ms < 10) interval_ms = 10; /* minimum 10ms */
     uloop_timeout_set(&ar->ping_timer, interval_ms);
 }
 
@@ -718,7 +719,6 @@ static void health_timer_cb(struct uloop_timeout *t)
 
     if (replaced) {
         refresh_reflector_addrs(ar);
-        }
     }
 
     uloop_timeout_set(t, (int)(c->reflector_health_check_interval_us / 1000));
@@ -805,7 +805,6 @@ int main(int argc, char *argv[])
 
     autorate_t ar;
     memset(&ar, 0, sizeof(ar));
-    ar.pinger_fd = -1;
 
     if (config_load(section, &ar.cfg) < 0) {
         fprintf(stderr, "cake-autorate: failed to load UCI config '%s'\n",

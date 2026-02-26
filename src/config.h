@@ -31,7 +31,6 @@ typedef struct {
     uint32_t connection_active_thr_kbps;
 
     /* Pinger */
-    char     pinger_method[16];   /* "fping" only for now */
     int      no_pingers;
     double   reflector_ping_interval_s;
 

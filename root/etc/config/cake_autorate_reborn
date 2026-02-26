@@ -18,7 +18,6 @@ config cake_autorate_reborn 'primary'
     option connection_active_thr_kbps '2000'
 
     # ── Pinger ───────────────────────────────────────────────
-    option pinger_method 'fping'
     option no_pingers '6'
     option reflector_ping_interval_s '0.3'
 
