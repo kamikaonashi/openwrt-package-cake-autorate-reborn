@@ -1,4 +1,4 @@
-OBJS = main.o config.o rate_monitor.o
+OBJS = main.o config.o rate_monitor.o tc_netlink.o
 BIN = cake-autorate-reborn
 
 all: $(BIN)

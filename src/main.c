@@ -21,12 +21,12 @@
 #include <time.h>
 #include <math.h>
 #include <sys/wait.h>
-#include <spawn.h>
 
 #include <libubox/uloop.h>
 
 #include "config.h"
 #include "rate_monitor.h"
+#include "tc_netlink.h"
 
 /* ────────────────────────────────────────────────────────────── */
 /*  Constants                                                     */
@@ -67,6 +67,7 @@ typedef struct {
 typedef struct {
     cake_config_t   cfg;
     rate_monitor_t  rm;
+    tc_nl_ctx_t    *tc_nl;
 
     /* Shaper rates (kbps) */
     uint32_t shaper_rate_kbps[2];
@@ -139,40 +140,6 @@ static void set_nonblocking(int fd)
         fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-extern char **environ;
-
-/*
- * argv[0] must be "tc". posix_spawnp resolves it via PATH.
- * Stdout and stderr are suppressed.
- * Returns the exit status of tc, or -1 on spawn/wait failure.
- */
-static int run_tc(const char *const *argv)
-{
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-
-    /* Open /dev/null directly in the child — no intermediate fd needed */
-    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO,
-                                     "/dev/null", O_WRONLY, 0);
-    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO,
-                                     "/dev/null", O_WRONLY, 0);
-
-    pid_t pid;
-    int ret = posix_spawnp(&pid, argv[0], &actions, NULL,
-                           (char *const *)argv, environ);
-
-    posix_spawn_file_actions_destroy(&actions);
-
-    if (ret != 0)
-        return -1;
-
-    int status;
-    if (waitpid(pid, &status, 0) < 0)
-        return -1;
-
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-}
-
 /* ────────────────────────────────────────────────────────────── */
 /*  CAKE rate control                                             */
 /* ────────────────────────────────────────────────────────────── */
@@ -228,30 +195,10 @@ static void set_shaper_rate(autorate_t *ar, int dir)
                                          : ar->cfg.adjust_ul_shaper_rate;
 
     if (adjust && iface[0] != '\0') {
-        char bw[32];
-        snprintf(bw, sizeof(bw), "%uKbit", rate);
-
-        /*
-         * 'tc qdisc change' modifies the existing root qdisc in-place,
-         * preserving all other CAKE options (diffserv, nat, wash, …).
-         * If CAKE is not yet on this interface, fall back to 'tc qdisc add'.
-         * argv[0] must be "tc" for execvp PATH search.
-         * Canonical order: tc qdisc <op> dev <if> root cake bandwidth <bw>
-         */
-        const char *argv_chg[] = {
-            "tc", "qdisc", "change", "dev", iface,
-            "root", "cake", "bandwidth", bw, NULL
-        };
-        if (run_tc(argv_chg) != 0) {
-            const char *argv_add[] = {
-                "tc", "qdisc", "add", "dev", iface,
-                "root", "cake", "bandwidth", bw, NULL
-            };
-            if (run_tc(argv_add) != 0)
-                syslog(LOG_WARNING,
-                       "tc: failed to change or add CAKE on %s at %uKbit",
-                       iface, rate);
-        }
+        /* tc_cake_set_bandwidth() tries RTM_NEWQDISC/change first,
+         * then falls back to RTM_NEWQDISC/add on ENOENT – identical
+         * semantics to the old two-command approach, but in-process. */
+        tc_cake_set_bandwidth(ar->tc_nl, iface, rate);
     }
 
     ar->last_shaper_rate_kbps[dir] = rate;
@@ -261,13 +208,10 @@ static void set_shaper_rate(autorate_t *ar, int dir)
  * reset_shaper_rate – restore unlimited bandwidth on shutdown so the
  * interface is not left permanently throttled.
  */
-static void reset_shaper_rate(const char *iface)
+static void reset_shaper_rate(autorate_t *ar, const char *iface)
 {
-    const char *argv[] = {
-        "tc", "qdisc", "change", "dev", iface,
-        "root", "cake", "bandwidth", "unlimited", NULL
-    };
-    run_tc(argv);
+    /* rate_kbps == 0  →  CAKE rate_bps == 0  →  unlimited */
+    tc_cake_set_bandwidth(ar->tc_nl, iface, 0);
 }
 
 /* ────────────────────────────────────────────────────────────── */
@@ -887,6 +831,14 @@ int main(int argc, char *argv[])
     /* Initialise rate monitor */
     rate_monitor_init(&ar.rm, ar.cfg.dl_if, ar.cfg.ul_if);
 
+    /* Open persistent NETLINK_ROUTE socket for CAKE bandwidth control */
+    ar.tc_nl = tc_nl_open();
+    if (!ar.tc_nl) {
+        syslog(LOG_ERR, "tc_netlink: failed to open netlink socket");
+        rate_monitor_cleanup(&ar.rm); 
+        return 1;
+    }
+
     /* Startup wait (before entering the event loop) */
     if (ar.cfg.startup_wait_s > 0.0)
         usleep((unsigned int)(ar.cfg.startup_wait_s * 1e6));
@@ -901,6 +853,7 @@ int main(int argc, char *argv[])
     if (start_fping(&ar) < 0) {
         syslog(LOG_ERR, "failed to start fping");
         rate_monitor_cleanup(&ar.rm);
+        tc_nl_close(ar.tc_nl); 
         return 1;
     }
 
@@ -935,9 +888,12 @@ int main(int argc, char *argv[])
     /* Restore unlimited bandwidth so the interface is not throttled
      * after we exit. */
     if (ar.cfg.adjust_dl_shaper_rate && ar.cfg.dl_if[0])
-        reset_shaper_rate(ar.cfg.dl_if);
+        reset_shaper_rate(&ar, ar.cfg.dl_if);
     if (ar.cfg.adjust_ul_shaper_rate && ar.cfg.ul_if[0])
-        reset_shaper_rate(ar.cfg.ul_if);
+        reset_shaper_rate(&ar, ar.cfg.ul_if);
+
+    tc_nl_close(ar.tc_nl);
+    ar.tc_nl = NULL;
 
     rate_monitor_cleanup(&ar.rm);
 

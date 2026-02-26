@@ -16,7 +16,7 @@ define Package/cake-autorate-reborn
   SECTION  := net
   CATEGORY := Network
   TITLE    := CAKE Autorate Reborn daemon
-  DEPENDS  := +libubox +libuci +fping +tc-full
+  DEPENDS  := +libubox +libuci +fping
 endef
 
 define Package/cake-autorate-reborn/description
