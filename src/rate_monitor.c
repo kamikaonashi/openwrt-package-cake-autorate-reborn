@@ -16,17 +16,39 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <errno.h>
 
 /* ── internal helpers ─────────────────────────────────────────── */
 
-static uint64_t read_bytes(const char *path)
+static uint64_t read_bytes_fd(int *fd_ptr, const char *path)
 {
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
-    unsigned long long v = 0;
-    fscanf(f, "%llu", &v);
-    fclose(f);
-    return (uint64_t)v;
+    char buf[64];
+
+    /* Reopen if interface was recreated */
+    if (*fd_ptr < 0) {
+        *fd_ptr = open(path, O_RDONLY);
+        if (*fd_ptr < 0)
+            return 0;
+    }
+
+    if (lseek(*fd_ptr, 0, SEEK_SET) == (off_t)-1) {
+        close(*fd_ptr);
+        *fd_ptr = -1;
+        return 0;
+    }
+
+    ssize_t n = read(*fd_ptr, buf, sizeof(buf) - 1);
+    if (n <= 0) {
+        close(*fd_ptr);
+        *fd_ptr = -1;
+        return 0;
+    }
+
+    buf[n] = '\0';
+    return (uint64_t)strtoull(buf, NULL, 10);
 }
 
 static int64_t now_us(void)
@@ -43,10 +65,11 @@ void rate_monitor_init(rate_monitor_t *rm,
 {
     memset(rm, 0, sizeof(*rm));
 
+    rm->rx_fd = -1;
+    rm->tx_fd = -1;
+
     /*
-     * DL interface: IFB and veth redirect ingress traffic through their
-     * TX queue, so tx_bytes is the correct counter.  All other interfaces
-     * (rare for DL) use rx_bytes.
+     * DL interface: IFB/veth use tx_bytes, others use rx_bytes
      */
     if (strncmp(dl_if, "ifb",  3) == 0 ||
         strncmp(dl_if, "veth", 4) == 0)
@@ -56,13 +79,29 @@ void rate_monitor_init(rate_monitor_t *rm,
         snprintf(rm->rx_path, sizeof(rm->rx_path),
                  "/sys/class/net/%s/statistics/rx_bytes", dl_if);
 
-    /* UL interface: upload is always genuine egress → tx_bytes. */
+    /* UL interface: always tx_bytes */
     snprintf(rm->tx_path, sizeof(rm->tx_path),
              "/sys/class/net/%s/statistics/tx_bytes", ul_if);
 
-    rm->prev_rx_bytes = read_bytes(rm->rx_path);
-    rm->prev_tx_bytes = read_bytes(rm->tx_path);
+    /* Try opening immediately */
+    rm->rx_fd = open(rm->rx_path, O_RDONLY);
+    rm->tx_fd = open(rm->tx_path, O_RDONLY);
+
+    rm->prev_rx_bytes = read_bytes_fd(&rm->rx_fd, rm->rx_path);
+    rm->prev_tx_bytes = read_bytes_fd(&rm->tx_fd, rm->tx_path);
     rm->t_prev_us     = now_us();
+}
+
+void rate_monitor_cleanup(rate_monitor_t *rm)
+{
+    if (rm->rx_fd >= 0)
+        close(rm->rx_fd);
+
+    if (rm->tx_fd >= 0)
+        close(rm->tx_fd);
+
+    rm->rx_fd = -1;
+    rm->tx_fd = -1;
 }
 
 int64_t rate_monitor_update(rate_monitor_t *rm,
@@ -71,16 +110,20 @@ int64_t rate_monitor_update(rate_monitor_t *rm,
 {
     int64_t t_now   = now_us();
     int64_t elapsed = t_now - rm->t_prev_us;
-    if (elapsed <= 0) elapsed = 1; /* guard against divide-by-zero */
+    if (elapsed <= 0)
+        elapsed = 1;
 
-    uint64_t rx = read_bytes(rm->rx_path);
-    uint64_t tx = read_bytes(rm->tx_path);
+    uint64_t rx = read_bytes_fd(&rm->rx_fd, rm->rx_path);
+    uint64_t tx = read_bytes_fd(&rm->tx_fd, rm->tx_path);
 
-    /* Guard against 32-bit counter wraparound */
-    uint64_t drx = (rx >= rm->prev_rx_bytes) ? (rx - rm->prev_rx_bytes) : 0;
-    uint64_t dtx = (tx >= rm->prev_tx_bytes) ? (tx - rm->prev_tx_bytes) : 0;
+    uint64_t drx = (rx >= rm->prev_rx_bytes)
+                   ? (rx - rm->prev_rx_bytes)
+                   : 0;
 
-    /* kbps = bytes * 8 / elapsed_s = bytes * 8 000 000 / elapsed_us */
+    uint64_t dtx = (tx >= rm->prev_tx_bytes)
+                   ? (tx - rm->prev_tx_bytes)
+                   : 0;
+
     *out_dl_kbps = (uint32_t)((drx * 8000000ULL) / (uint64_t)elapsed);
     *out_ul_kbps = (uint32_t)((dtx * 8000000ULL) / (uint64_t)elapsed);
 

@@ -21,6 +21,7 @@
 #include <time.h>
 #include <math.h>
 #include <sys/wait.h>
+#include <spawn.h>
 
 #include <libubox/uloop.h>
 
@@ -138,35 +139,38 @@ static void set_nonblocking(int fd)
         fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
+extern char **environ;
+
 /*
- * run_tc – fork+exec tc using PATH search (execvp).
- *
- * On OpenWrt, tc lives at /usr/sbin/tc (not /sbin/tc), so we use
- * execvp("tc", ...) rather than execv with a hardcoded path.
- * argv[0] must be "tc".  Stdout and stderr are suppressed.
- * Returns the exit status of tc, or -1 on fork/exec failure.
+ * argv[0] must be "tc". posix_spawnp resolves it via PATH.
+ * Stdout and stderr are suppressed.
+ * Returns the exit status of tc, or -1 on spawn/wait failure.
  */
 static int run_tc(const char *const *argv)
 {
-    pid_t pid = fork();
-    if (pid < 0) return -1;
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
 
-    if (pid == 0) {
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDOUT_FILENO);
-            dup2(devnull, STDERR_FILENO);
-            close(devnull);
-        }
-        /* execvp searches PATH – works regardless of whether tc is in
-         * /sbin, /usr/sbin, or elsewhere. */
-        execvp("tc", (char *const *)argv);
-        _exit(127);
-    }
+    /* Open /dev/null directly in the child — no intermediate fd needed */
+    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO,
+                                     "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO,
+                                     "/dev/null", O_WRONLY, 0);
 
-    int st = 0;
-    waitpid(pid, &st, 0);
-    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    pid_t pid;
+    int ret = posix_spawnp(&pid, argv[0], &actions, NULL,
+                           (char *const *)argv, environ);
+
+    posix_spawn_file_actions_destroy(&actions);
+
+    if (ret != 0)
+        return -1;
+
+    int status;
+    if (waitpid(pid, &status, 0) < 0)
+        return -1;
+
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 /* ────────────────────────────────────────────────────────────── */
@@ -183,19 +187,41 @@ static void clamp_shaper_rate(autorate_t *ar, int dir)
 }
 
 /*
- * set_shaper_rate – apply the current shaper rate to the kernel via
- * 'tc qdisc change … cake bandwidth <N>Kbit'.
- *
- * tc qdisc change preserves all existing CAKE options (diffserv, nat,
- * wash, etc.) that are not explicitly mentioned, so we only need to
- * specify the new bandwidth.
- *
+ * set_shaper_rate – apply the current shaper rate to the kernel.
+ * Includes optimization to prevent thrashing on micro-adjustments.
  */
 static void set_shaper_rate(autorate_t *ar, int dir)
 {
-    uint32_t rate = ar->shaper_rate_kbps[dir];
-    if (rate == ar->last_shaper_rate_kbps[dir])
+    uint32_t rate     = ar->shaper_rate_kbps[dir];
+    uint32_t old_rate = ar->last_shaper_rate_kbps[dir];
+
+    if (rate == old_rate)
         return;
+
+    /*
+     * HYSTERESIS OPTIMIZATION:
+     * Don't fork 'tc' for insignificant changes (< 0.5%) unless we are
+     * hitting the exact min/max limits. This prevents CPU churn.
+     */
+    uint32_t min_limit = (dir == DIR_DL) ? ar->cfg.min_dl_shaper_rate_kbps 
+                                         : ar->cfg.min_ul_shaper_rate_kbps;
+    uint32_t max_limit = (dir == DIR_DL) ? ar->cfg.max_dl_shaper_rate_kbps 
+                                         : ar->cfg.max_ul_shaper_rate_kbps;
+
+    // Calculate absolute difference
+    uint32_t diff = (rate > old_rate) ? (rate - old_rate) : (old_rate - rate);
+    
+    // Threshold is 0.5% of current rate (e.g., 100kbps at 20Mbps, 1.5Mbps at 300Mbps)
+    uint32_t base = old_rate ? old_rate : rate;
+
+    uint32_t threshold = base / 200;            /* 0.5% */
+    uint32_t floor_val = (base < 5000) ? (base / 100) : 50; /* 1% below 5 Mbps */
+    if (threshold < floor_val) threshold = floor_val;
+
+    // If change is small AND we are not snapping to a rail (min/max), skip update
+    if (diff < threshold && rate != min_limit && rate != max_limit) {
+        return;
+    }
 
     const char *iface  = (dir == DIR_DL) ? ar->cfg.dl_if : ar->cfg.ul_if;
     int         adjust = (dir == DIR_DL) ? ar->cfg.adjust_dl_shaper_rate
@@ -767,7 +793,8 @@ static void rate_timer_cb(struct uloop_timeout *t)
         }
     }
 
-    uloop_timeout_set(t, (int)(next / 1000));
+    int ms = (int)((next / 1000) & 0x7FFFFFFF);
+    uloop_timeout_set(t, ms);
 }
 
 /* ────────────────────────────────────────────────────────────── */
@@ -873,6 +900,7 @@ int main(int argc, char *argv[])
     /* Start fping */
     if (start_fping(&ar) < 0) {
         syslog(LOG_ERR, "failed to start fping");
+        rate_monitor_cleanup(&ar.rm);
         return 1;
     }
 
@@ -910,6 +938,8 @@ int main(int argc, char *argv[])
         reset_shaper_rate(ar.cfg.dl_if);
     if (ar.cfg.adjust_ul_shaper_rate && ar.cfg.ul_if[0])
         reset_shaper_rate(ar.cfg.ul_if);
+
+    rate_monitor_cleanup(&ar.rm);
 
     free(ar.dl_delays);
     free(ar.ul_delays);
