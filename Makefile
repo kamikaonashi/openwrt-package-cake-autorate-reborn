@@ -16,12 +16,12 @@ define Package/cake-autorate-reborn
   SECTION  := net
   CATEGORY := Network
   TITLE    := CAKE Autorate Reborn daemon
-  DEPENDS  := +libubox +libuci +fping
+  DEPENDS  := +libubox +libuci
 endef
 
 define Package/cake-autorate-reborn/description
   C rewrite of cake-autorate: adaptively adjusts CAKE qdisc bandwidth
-  based on measured one-way delay (OWD) via fping. Supports multiple
+  based on measured one-way delay (OWD). Supports multiple
   instances, automatic reflector replacement, and procd supervision.
 endef
 

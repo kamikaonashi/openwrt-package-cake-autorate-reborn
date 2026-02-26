@@ -20,7 +20,7 @@ While the algorithm is excellent at mitigating bufferbloat, running a complex ba
 - **Event-Driven Architecture:** Utilizes `libubox/uloop` to eliminate polling busy-loops.
 - **Efficient System I/O:** Reads network statistics directly from `/sys/class/net/.../statistics` rather than invoking shell commands.
 - **Direct Traffic Control:** Applies CAKE bandwidth changes directly via `tc qdisc change` without spawning an interactive shell.
-- **Asynchronous Pinging:** Uses a background `fping` child process with non-blocking pipe I/O.
+- **Asynchronous Pinging:** Uses a custom written pinger for less cpu cycles
 - **Dynamic Reflector Health:** Automatically monitors and replaces unresponsive ping targets.
 - **Flash Storage Safe:** All state data is kept in RAM. Zero flash writes occur during runtime.
 - **LuCI Web Interface:** Includes a fully integrated UI for configuring settings and controlling the service state.
@@ -29,7 +29,7 @@ While the algorithm is excellent at mitigating bufferbloat, running a complex ba
 
 ## How It Works
 
-The service continuously measures round-trip time via `fping`, utilizing `RTT/2` as a proxy for One-Way Delay (OWD). It maintains an asymmetric Exponentially Weighted Moving Average (EWMA) baseline for each reflector and classifies network load into four states:
+The service continuously measures round-trip time utilizing `RTT/2` as a proxy for One-Way Delay (OWD). It maintains an asymmetric Exponentially Weighted Moving Average (EWMA) baseline for each reflector and classifies network load into four states:
 
 | State | Condition | Action |
 | :--- | :--- | :--- |
@@ -46,7 +46,7 @@ The service continuously measures round-trip time via `fping`, utilizing `RTT/2`
 The service requires the following standard OpenWrt packages:
 
     apk update
-    apk add fping libubox libuci
+    apk add libubox libuci
 
 Installing from Release
 
