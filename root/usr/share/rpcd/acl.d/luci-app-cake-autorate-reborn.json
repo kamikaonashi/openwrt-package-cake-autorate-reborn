@@ -1,0 +1,11 @@
+{
+    "luci-app-cake-autorate-reborn": {
+        "description": "Grant UCI access for luci-app-cake-autorate-reborn",
+        "read": {
+            "uci": [ "cake_autorate_reborn" ]
+        },
+        "write": {
+            "uci": [ "cake_autorate_reborn" ]
+        }
+    }
+}

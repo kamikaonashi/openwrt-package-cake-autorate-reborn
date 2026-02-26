@@ -1,0 +1,87 @@
+config cake_autorate_reborn 'primary'
+    # ── Enable / disable ─────────────────────────────────────
+    option enabled '0'
+
+    # ── Interfaces ───────────────────────────────────────────
+    option dl_if 'ifb-wan'
+    option ul_if 'wan'
+    option adjust_dl_shaper_rate '1'
+    option adjust_ul_shaper_rate '1'
+
+    # ── Shaper rates (kbps) ──────────────────────────────────
+    option min_dl_shaper_rate_kbps  '5000'
+    option base_dl_shaper_rate_kbps '20000'
+    option max_dl_shaper_rate_kbps  '80000'
+    option min_ul_shaper_rate_kbps  '5000'
+    option base_ul_shaper_rate_kbps '20000'
+    option max_ul_shaper_rate_kbps  '35000'
+    option connection_active_thr_kbps '2000'
+
+    # ── Pinger ───────────────────────────────────────────────
+    option pinger_method 'fping'
+    option no_pingers '6'
+    option reflector_ping_interval_s '0.3'
+
+    # First no_pingers entries are active; the rest are spares
+    # used to replace misbehaving reflectors.
+    list reflectors '1.1.1.1'
+    list reflectors '1.0.0.1'
+    list reflectors '8.8.8.8'
+    list reflectors '8.8.4.4'
+    list reflectors '9.9.9.9'
+    list reflectors '9.9.9.10'
+    list reflectors '94.140.14.15'
+    list reflectors '94.140.14.140'
+    list reflectors '208.67.220.220'
+    list reflectors '208.67.222.222'
+
+    # ── OWD thresholds (ms) ──────────────────────────────────
+    option dl_avg_owd_delta_max_adjust_up_thr_ms   '10.0'
+    option ul_avg_owd_delta_max_adjust_up_thr_ms   '10.0'
+    option dl_owd_delta_delay_thr_ms               '30.0'
+    option ul_owd_delta_delay_thr_ms               '30.0'
+    option dl_avg_owd_delta_max_adjust_down_thr_ms '60.0'
+    option ul_avg_owd_delta_max_adjust_down_thr_ms '60.0'
+
+    # ── EWMA / baseline ──────────────────────────────────────
+    option alpha_baseline_increase '0.001'
+    option alpha_baseline_decrease '0.9'
+    option alpha_delta_ewma        '0.095'
+
+    # ── Rate adjustment multipliers ──────────────────────────
+    option shaper_rate_min_adjust_down_bufferbloat '0.99'
+    option shaper_rate_max_adjust_down_bufferbloat '0.75'
+    option shaper_rate_min_adjust_up_load_high     '1.0'
+    option shaper_rate_max_adjust_up_load_high     '1.04'
+    option shaper_rate_adjust_down_load_low        '0.99'
+    option shaper_rate_adjust_up_load_low          '1.01'
+
+    # ── Bufferbloat detection ────────────────────────────────
+    option bufferbloat_detection_window '6'
+    option bufferbloat_detection_thr    '3'
+    option high_load_thr                '0.75'
+    option bufferbloat_refractory_period_ms '300'
+    option decay_refractory_period_ms       '1000'
+
+    # ── Reflector health ─────────────────────────────────────
+    option reflector_health_check_interval_s         '1'
+    option reflector_response_deadline_s             '1'
+    option reflector_misbehaving_detection_window    '60'
+    option reflector_misbehaving_detection_thr       '3'
+    option reflector_replacement_interval_s          '3600'
+    option reflector_comparison_interval_s           '60'
+    option reflector_sum_owd_baselines_delta_thr_ms  '20.0'
+    option reflector_owd_delta_ewma_delta_thr_ms     '10.0'
+
+    # ── Stall detection ──────────────────────────────────────
+    option stall_detection_thr           '5'
+    option connection_stall_thr_kbps     '10'
+    option global_ping_response_timeout_s '10.0'
+
+    # ── Misc ─────────────────────────────────────────────────
+    option enable_sleep_function              '1'
+    option sustained_idle_sleep_thr_s         '60.0'
+    option min_shaper_rates_enforcement       '0'
+    option startup_wait_s                     '0.0'
+    option monitor_achieved_rates_interval_ms '200'
+    option if_up_check_interval_s             '10.0'

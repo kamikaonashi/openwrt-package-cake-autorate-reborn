@@ -1,0 +1,10 @@
+{
+    "admin/services/cake-autorate-reborn": {
+        "title": "CAKE Autorate Reborn",
+        "order": 60,
+        "action": {
+            "type": "view",
+            "path": "cake-autorate-reborn"
+        }
+    }
+}
