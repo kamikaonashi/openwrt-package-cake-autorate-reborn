@@ -1,0 +1,75 @@
+name: Build and Release Packages
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}-${{ matrix.version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - SNAPSHOT  # OpenWrt 25.12 Apk
+          - 24.10.0   # OpenWrt 24.10 Ipk
+        arch:
+          # --- High-Performance ARM ---
+          - aarch64_cortex-a53
+          - aarch64_cortex-a72
+          - aarch64_generic
+          
+          # --- Mid-Range ARM ---
+          - arm_cortex-a7_neon-vfpv4
+          - arm_cortex-a15_neon-vfpv4
+          
+          # --- Standard MIPS ---
+          - mips_24kc
+          - mipsel_24kc
+          
+          # --- x86 / PC ---
+          - x86_64
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build with OpenWrt SDK
+        uses: openwrt/gh-action-sdk@main
+        env:
+          ARCH: ${{ matrix.arch }}-${{ matrix.version }}
+          PACKAGES: cake-autorate-reborn
+          IGNORE_ERRORS: 0 
+          
+      - name: Collect Packages
+        run: |
+          mkdir -p dist
+          
+          # Only find packages that have "autorate-reborn" in the name
+          for file in $(find bin/packages/ -type f \( -name "*autorate-reborn*.apk" -o -name "*autorate-reborn*.ipk" \)); do
+            filename=$(basename "$file")
+            
+            # Prefix the architecture to the filename so they don't overwrite each other
+            cp "$file" "dist/${{ matrix.arch }}_${filename}"
+          done
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cake-autorate-${{ matrix.arch }}-${{ matrix.version }}
+          path: dist/*
+          
+      - name: Add to GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
