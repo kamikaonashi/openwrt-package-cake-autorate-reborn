@@ -27,7 +27,7 @@ endef
 
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
-	$(CP) ./src/*.c ./src/*.h ./src/Makefile $(PKG_BUILD_DIR)/
+	$(CP) ../src/*.c ../src/*.h ../src/Makefile $(PKG_BUILD_DIR)/
 endef
 
 define Build/Compile
@@ -42,16 +42,13 @@ endef
 
 define Package/cake-autorate-reborn/install
 	$(INSTALL_DIR) $(1)/usr/sbin
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/cake-autorate-reborn \
-	               $(1)/usr/sbin/
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/cake-autorate-reborn $(1)/usr/sbin/
 
 	$(INSTALL_DIR) $(1)/etc/init.d
-	$(INSTALL_BIN) ./root/etc/init.d/cake-autorate-reborn \
-	               $(1)/etc/init.d/
+	$(INSTALL_BIN) ../root/etc/init.d/cake-autorate-reborn $(1)/etc/init.d/
 
 	$(INSTALL_DIR)  $(1)/etc/config
-	$(INSTALL_CONF) ./root/etc/config/cake_autorate_reborn \
-	                $(1)/etc/config/
+	$(INSTALL_CONF) ../root/etc/config/cake_autorate_reborn $(1)/etc/config/
 endef
 
 $(eval $(call BuildPackage,cake-autorate-reborn))
@@ -76,17 +73,17 @@ endef
 define Package/luci-app-cake-autorate-reborn/install
 	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d
 	$(INSTALL_DATA) \
-		./root/usr/share/luci/menu.d/luci-app-cake-autorate-reborn.json \
+		../root/usr/share/luci/menu.d/luci-app-cake-autorate-reborn.json \
 		$(1)/usr/share/luci/menu.d/
 
 	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
 	$(INSTALL_DATA) \
-		./root/usr/share/rpcd/acl.d/luci-app-cake-autorate-reborn.json \
+		../root/usr/share/rpcd/acl.d/luci-app-cake-autorate-reborn.json \
 		$(1)/usr/share/rpcd/acl.d/
 
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/view
 	$(INSTALL_DATA) \
-		./luci-app-cake-autorate-reborn/www/luci-static/resources/view/cake-autorate-reborn.js \
+		../luci-app-cake-autorate-reborn/www/luci-static/resources/view/cake-autorate-reborn.js \
 		$(1)/www/luci-static/resources/view/
 endef
 
