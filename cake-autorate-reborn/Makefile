@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME    := cake-autorate-reborn
-PKG_VERSION := 1.0.0
+PKG_VERSION := 1.0.1
 PKG_RELEASE := 1
 
 PKG_LICENSE         := GPL-2.0-or-later
@@ -35,7 +35,7 @@ define Build/Compile
 		--no-print-directory \
 		CC="$(TARGET_CC)" \
 		CFLAGS="$(TARGET_CFLAGS) -O2 -pipe -I$(STAGING_DIR)/usr/include" \
-		LDFLAGS="$(TARGET_LDFLAGS) -L$(STAGING_DIR)/usr/lib -lubox -luci -lm"
+		LDFLAGS="$(TARGET_LDFLAGS) -L$(STAGING_DIR)/usr/lib -lubox -luci"
 	$(TARGET_CROSS)strip --strip-unneeded \
 		$(PKG_BUILD_DIR)/cake-autorate-reborn
 endef

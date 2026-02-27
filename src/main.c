@@ -19,7 +19,6 @@
 #include <signal.h>
 #include <syslog.h>
 #include <time.h>
-#include <math.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -351,13 +350,16 @@ static void process_owd(autorate_t *ar,
         return;
     }
 
-    /* Asymmetric EWMA baseline update */
+    /*
+     * Asymmetric EWMA baseline update.
+     * alpha fields are stored *1,000,000 (_fp), so no float conversion needed.
+     */
     int64_t dl_alpha = (dl_owd_us > r->dl_owd_baseline_us)
-        ? (int64_t)(c->alpha_baseline_increase * 1e6)
-        : (int64_t)(c->alpha_baseline_decrease * 1e6);
+        ? c->alpha_baseline_increase
+        : c->alpha_baseline_decrease;
     int64_t ul_alpha = (ul_owd_us > r->ul_owd_baseline_us)
-        ? (int64_t)(c->alpha_baseline_increase * 1e6)
-        : (int64_t)(c->alpha_baseline_decrease * 1e6);
+        ? c->alpha_baseline_increase
+        : c->alpha_baseline_decrease;
 
     r->dl_owd_baseline_us =
           dl_alpha * dl_owd_us           / 1000000LL
@@ -372,7 +374,8 @@ static void process_owd(autorate_t *ar,
     /* EWMA of delta – only while under high load */
     if (ar->load_condition[DIR_DL] == LOAD_HIGH ||
         ar->load_condition[DIR_UL] == LOAD_HIGH) {
-        int64_t ae = (int64_t)(c->alpha_delta_ewma * 1e6);
+        /* alpha_delta_ewma is stored _fp (*1,000,000) */
+        int64_t ae = c->alpha_delta_ewma;
         r->dl_owd_delta_ewma_us =
               ae * dl_delta             / 1000000LL
             + (1000000LL - ae) * r->dl_owd_delta_ewma_us / 1000000LL;
@@ -411,9 +414,11 @@ static void process_owd(autorate_t *ar,
     ar->bufferbloat_detected[DIR_UL] =
         (ar->sum_ul_delays >= c->bufferbloat_detection_thr);
 
-    /* Load classification */
-    uint32_t high_thr_dl = (uint32_t)(c->high_load_thr * ar->shaper_rate_kbps[DIR_DL]);
-    uint32_t high_thr_ul = (uint32_t)(c->high_load_thr * ar->shaper_rate_kbps[DIR_UL]);
+    /* high_load_thr is _fp (*1,000,000): use integer multiply then divide */
+    uint32_t high_thr_dl = (uint32_t)((uint64_t)ar->shaper_rate_kbps[DIR_DL]
+                                      * (uint64_t)c->high_load_thr / 1000000ULL);
+    uint32_t high_thr_ul = (uint32_t)((uint64_t)ar->shaper_rate_kbps[DIR_UL]
+                                      * (uint64_t)c->high_load_thr / 1000000ULL);
 
     for (int d = 0; d < 2; d++) {
         uint32_t ach = ar->achieved_rate_kbps[d];
@@ -606,9 +611,10 @@ static void ping_timer_cb(struct uloop_timeout *t)
                  (struct sockaddr *)&dst, sizeof(dst));
 
 out:
-    /* Calculate the interval between individual pings to maintain the global rate */
-    int interval_ms = (int)((c->reflector_ping_interval_s * 1000.0) / ar->no_active_reflectors);
-    if (interval_ms < 10) interval_ms = 10; /* minimum 10ms */
+    /* reflector_ping_interval_us is already in µs; integer division only */
+    int interval_ms = (int)((c->reflector_ping_interval_us / 1000)
+                            / ar->no_active_reflectors);
+    if (interval_ms < 10) interval_ms = 10; /* minimum 10 ms */
     uloop_timeout_set(&ar->ping_timer, interval_ms);
 }
 
@@ -635,7 +641,7 @@ static int start_pinger(autorate_t *ar)
     ar->icmp_ufd.cb = icmp_reply_cb;
     uloop_fd_add(&ar->icmp_ufd, ULOOP_READ | ULOOP_EDGE_TRIGGER);
 
-    ar->ping_id = (uint16_t)(getpid() & 0xFFFF);
+    ar->ping_id = (uint16_t)(getpid() ^ ((uint16_t)time(NULL)));
     ar->ping_seq = 0;
     ar->ping_rr_idx = 0;
 
@@ -849,9 +855,18 @@ int main(int argc, char *argv[])
     ar.last_shaper_rate_kbps[DIR_DL] = 0;
     ar.last_shaper_rate_kbps[DIR_UL] = 0;
 
+    /* reflector_ping_interval_us is already in µs */
     ar.ping_response_interval_us =
-        (int64_t)(ar.cfg.reflector_ping_interval_s * 1e6)
+        ar.cfg.reflector_ping_interval_us
         / ar.no_active_reflectors;
+
+    /* Open persistent NETLINK_ROUTE socket for CAKE bandwidth control */
+    ar.tc_nl = tc_nl_open();
+    if (!ar.tc_nl) {
+        syslog(LOG_ERR, "tc_netlink: failed to open netlink socket");
+        rate_monitor_cleanup(&ar.rm);
+        return 1;
+    }
 
     /* Apply initial CAKE rates */
     set_shaper_rate(&ar, DIR_DL);
@@ -860,23 +875,14 @@ int main(int argc, char *argv[])
     /* Initialise rate monitor */
     rate_monitor_init(&ar.rm, ar.cfg.dl_if, ar.cfg.ul_if);
 
-    /* Open persistent NETLINK_ROUTE socket for CAKE bandwidth control */
-    ar.tc_nl = tc_nl_open();
-    if (!ar.tc_nl) {
-        syslog(LOG_ERR, "tc_netlink: failed to open netlink socket");
-        rate_monitor_cleanup(&ar.rm); 
-        return 1;
-    }
-
-    /* Startup wait (before entering the event loop) */
-    if (ar.cfg.startup_wait_s > 0.0)
-        usleep((unsigned int)(ar.cfg.startup_wait_s * 1e6));
+    /* Startup wait */
+    if (ar.cfg.startup_wait_us > 0)
+        usleep((unsigned int)ar.cfg.startup_wait_us);
 
     /* uloop */
     uloop_init();
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
-    signal(SIGCHLD, SIG_DFL); /* ensure waitpid works normally */
 
     /* Start integrated pinger */
     if (start_pinger(&ar) < 0) {

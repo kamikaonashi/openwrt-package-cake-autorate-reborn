@@ -15,15 +15,50 @@ static const char *uci_get(struct uci_context *ctx,
 }
 
 /*
+ * parse_fixed – convert a decimal string to integer with a given scale.
+ *
+ *   parse_fixed("0.3",  1000000) == 300000   (0.3 s > µs)
+ *   parse_fixed("0.001",1000000) == 1000     (α = 0.001 in _fp)
+ *   parse_fixed("10",   1000000) == 10000000 (10 s > µs)
+ *   parse_fixed("1.04", 1000000) == 1040000  (rate multiplier)
+ *
+ * No floating-point instructions are generated.
+ */
+static int64_t parse_fixed(const char *s, int64_t scale)
+{
+    if (!s || !*s) return 0;
+
+    int neg = 0;
+    if (*s == '-') { neg = 1; s++; }
+
+    int64_t intpart  = 0;
+    int64_t fracpart = 0;
+    int64_t fracdiv  = 1;
+
+    while (*s >= '0' && *s <= '9')
+        intpart = intpart * 10 + (*s++ - '0');
+
+    if (*s == '.') {
+        s++;
+        while (*s >= '0' && *s <= '9') {
+            fracpart = fracpart * 10 + (*s++ - '0');
+            fracdiv  *= 10;
+        }
+    }
+
+    int64_t result = intpart * scale + fracpart * scale / fracdiv;
+    return neg ? -result : result;
+}
+
+/*
  * Conversion macros
  *   UCI_STR   – string field
  *   UCI_INT   – int field, UCI value is a plain integer
  *   UCI_U32   – uint32_t field
- *   UCI_DBL   – double field (value stored as-is)
- *   UCI_MS_US – int64_t field, UCI value is in milliseconds, stored as µs
- *   UCI_S_US  – int64_t field, UCI value is in seconds,      stored as µs
- *   UCI_MULT  – int64_t field, UCI value is a multiplier (e.g. 0.99),
- *               stored as value * 1e6 (fixed-point *1e6)
+ *   UCI_MS_US – int64_t field, UCI value in milliseconds > stored as µs
+ *   UCI_S_US  – int64_t field, UCI value in seconds      > stored as µs
+ *   UCI_FP    – int64_t _fp field, UCI value is a ratio (e.g. 0.99)
+ *               stored as value * 1,000,000
  */
 #define UCI_STR(field, name) \
     do { const char *_v = uci_get(ctx, sec, name); \
@@ -37,21 +72,17 @@ static const char *uci_get(struct uci_context *ctx,
     do { const char *_v = uci_get(ctx, sec, name); \
          if (_v) cfg->field = (uint32_t)strtoul(_v, NULL, 10); } while(0)
 
-#define UCI_DBL(field, name) \
-    do { const char *_v = uci_get(ctx, sec, name); \
-         if (_v) cfg->field = strtod(_v, NULL); } while(0)
-
 #define UCI_MS_US(field, name) \
     do { const char *_v = uci_get(ctx, sec, name); \
-         if (_v) cfg->field = (int64_t)(strtod(_v, NULL) * 1000.0); } while(0)
+         if (_v) cfg->field = parse_fixed(_v, 1000LL); } while(0)
 
 #define UCI_S_US(field, name) \
     do { const char *_v = uci_get(ctx, sec, name); \
-         if (_v) cfg->field = (int64_t)(strtod(_v, NULL) * 1000000.0); } while(0)
+         if (_v) cfg->field = parse_fixed(_v, 1000000LL); } while(0)
 
-#define UCI_MULT(field, name) \
+#define UCI_FP(field, name) \
     do { const char *_v = uci_get(ctx, sec, name); \
-         if (_v) cfg->field = (int64_t)(strtod(_v, NULL) * 1e6); } while(0)
+         if (_v) cfg->field = parse_fixed(_v, 1000000LL); } while(0)
 
 /* ── defaults ────────────────────────────────────────────────── */
 
@@ -59,8 +90,8 @@ void config_set_defaults(cake_config_t *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
 
-    snprintf(cfg->dl_if,  sizeof(cfg->dl_if),  "ifb-wan");
-    snprintf(cfg->ul_if,  sizeof(cfg->ul_if),  "wan");
+    snprintf(cfg->dl_if, sizeof(cfg->dl_if), "ifb-wan");
+    snprintf(cfg->ul_if, sizeof(cfg->ul_if), "wan");
 
     cfg->enabled                 = 0;
     cfg->adjust_dl_shaper_rate   = 1;
@@ -73,16 +104,16 @@ void config_set_defaults(cake_config_t *cfg)
     cfg->max_ul_shaper_rate_kbps  = 35000;
     cfg->connection_active_thr_kbps = 2000;
 
-    cfg->no_pingers              = 6;
-    cfg->reflector_ping_interval_s = 0.3;
+    cfg->no_pingers                 = 6;
+    cfg->reflector_ping_interval_us = 300000;   /* 0.3 s */
 
     /* Built-in reflectors */
     static const char *def_refs[] = {
         "1.1.1.1", "1.0.0.1",
         "8.8.8.8", "8.8.4.4",
         "9.9.9.9", "9.9.9.10",
-        "94.140.14.15", "94.140.14.140",
-        "208.67.220.220", "208.67.222.222",
+        "94.140.14.15",  "94.140.14.140",
+        "208.67.220.220","208.67.222.222",
         NULL
     };
     cfg->no_reflectors = 0;
@@ -91,7 +122,7 @@ void config_set_defaults(cake_config_t *cfg)
         cfg->no_reflectors++;
     }
 
-    /* OWD thresholds (stored in µs) */
+    /* OWD thresholds (µs) */
     cfg->dl_avg_owd_delta_max_adjust_up_thr_us   = 10000;
     cfg->ul_avg_owd_delta_max_adjust_up_thr_us   = 10000;
     cfg->dl_owd_delta_delay_thr_us               = 30000;
@@ -99,50 +130,50 @@ void config_set_defaults(cake_config_t *cfg)
     cfg->dl_avg_owd_delta_max_adjust_down_thr_us = 60000;
     cfg->ul_avg_owd_delta_max_adjust_down_thr_us = 60000;
 
-    /* EWMA */
-    cfg->alpha_baseline_increase = 0.001;
-    cfg->alpha_baseline_decrease = 0.9;
-    cfg->alpha_delta_ewma        = 0.095;
+    /* EWMA alphas (_fp = value * 1,000,000) */
+    cfg->alpha_baseline_increase =    1000;   /* 0.001 */
+    cfg->alpha_baseline_decrease = 900000;    /* 0.9   */
+    cfg->alpha_delta_ewma        =  95000;    /* 0.095 */
 
-    /* Rate multipliers (*1e6 fixed-point) */
-    cfg->shaper_rate_min_adjust_down_bufferbloat = (int64_t)(0.99 * 1e6);
-    cfg->shaper_rate_max_adjust_down_bufferbloat = (int64_t)(0.75 * 1e6);
-    cfg->shaper_rate_min_adjust_up_load_high     = (int64_t)(1.00 * 1e6);
-    cfg->shaper_rate_max_adjust_up_load_high     = (int64_t)(1.04 * 1e6);
-    cfg->shaper_rate_adjust_down_load_low        = (int64_t)(0.99 * 1e6);
-    cfg->shaper_rate_adjust_up_load_low          = (int64_t)(1.01 * 1e6);
+    /* Rate multipliers (_fp) */
+    cfg->shaper_rate_min_adjust_down_bufferbloat = 990000;   /* 0.99 */
+    cfg->shaper_rate_max_adjust_down_bufferbloat = 750000;   /* 0.75 */
+    cfg->shaper_rate_min_adjust_up_load_high     = 1000000;  /* 1.00 */
+    cfg->shaper_rate_max_adjust_up_load_high     = 1040000;  /* 1.04 */
+    cfg->shaper_rate_adjust_down_load_low        = 990000;   /* 0.99 */
+    cfg->shaper_rate_adjust_up_load_low          = 1010000;  /* 1.01 */
 
     /* Detection */
     cfg->bufferbloat_detection_window = 6;
     cfg->bufferbloat_detection_thr    = 3;
-    cfg->high_load_thr                = 0.75;
+    cfg->high_load_thr                = 750000;  /* 0.75 _fp */
 
     /* Refractory periods (µs) */
-    cfg->bufferbloat_refractory_period_us = 300000;    /* 300 ms */
-    cfg->decay_refractory_period_us       = 1000000;   /* 1 s   */
+    cfg->bufferbloat_refractory_period_us = 300000;          /* 300 ms */
+    cfg->decay_refractory_period_us       = 1000000;         /* 1 s    */
 
     /* Reflector health */
-    cfg->reflector_health_check_interval_us     = 1000000;         /* 1 s  */
-    cfg->reflector_response_deadline_us         = 1000000;         /* 1 s  */
+    cfg->reflector_health_check_interval_us     = 1000000;            /* 1 s   */
+    cfg->reflector_response_deadline_us         = 1000000;            /* 1 s   */
     cfg->reflector_misbehaving_detection_window = 60;
     cfg->reflector_misbehaving_detection_thr    = 3;
-    cfg->reflector_replacement_interval_us      = 3600LL * 1000000LL; /* 1 hr */
-    cfg->reflector_comparison_interval_us       = 60LL  * 1000000LL; /* 1 min */
-    cfg->reflector_sum_owd_baselines_delta_thr_ms = 20.0;
-    cfg->reflector_owd_delta_ewma_delta_thr_ms    = 10.0;
+    cfg->reflector_replacement_interval_us      = 3600LL * 1000000LL; /* 1 hr  */
+    cfg->reflector_comparison_interval_us       =   60LL * 1000000LL; /* 1 min */
+    cfg->reflector_sum_owd_baselines_delta_thr_us = 20000;  /* 20 ms */
+    cfg->reflector_owd_delta_ewma_delta_thr_us    = 10000;  /* 10 ms */
 
     /* Stall */
-    cfg->stall_detection_thr        = 5;
-    cfg->connection_stall_thr_kbps  = 10;
-    cfg->global_ping_response_timeout_s = 10.0;
+    cfg->stall_detection_thr             = 5;
+    cfg->connection_stall_thr_kbps       = 10;
+    cfg->global_ping_response_timeout_us = 10000000;  /* 10 s */
 
     /* Misc */
-    cfg->sustained_idle_sleep_thr_s         = 60.0;
-    cfg->min_shaper_rates_enforcement       = 0;
-    cfg->enable_sleep_function              = 1;
-    cfg->startup_wait_s                     = 0.0;
-    cfg->monitor_achieved_rates_interval_us = 200000; /* 200 ms */
-    cfg->if_up_check_interval_s             = 10.0;
+    cfg->sustained_idle_sleep_thr_us         = 60000000;  /* 60 s   */
+    cfg->min_shaper_rates_enforcement        = 0;
+    cfg->enable_sleep_function               = 1;
+    cfg->startup_wait_us                     = 0;
+    cfg->monitor_achieved_rates_interval_us  = 200000;   /* 200 ms */
+    cfg->if_up_check_interval_us             = 10000000; /* 10 s   */
 }
 
 /* ── UCI load ────────────────────────────────────────────────── */
@@ -186,9 +217,9 @@ int config_load(const char *section_name, cake_config_t *cfg)
     UCI_U32(max_ul_shaper_rate_kbps,    "max_ul_shaper_rate_kbps");
     UCI_U32(connection_active_thr_kbps, "connection_active_thr_kbps");
 
-    /* Pinger */
-    UCI_INT(no_pingers,                 "no_pingers");
-    UCI_DBL(reflector_ping_interval_s,  "reflector_ping_interval_s");
+    /* Pinger – UCI value is in seconds */
+    UCI_INT(no_pingers,                  "no_pingers");
+    UCI_S_US(reflector_ping_interval_us, "reflector_ping_interval_s");
 
     /* Reflectors list */
     struct uci_option *refl_opt = uci_lookup_option(ctx, sec, "reflectors");
@@ -202,7 +233,7 @@ int config_load(const char *section_name, cake_config_t *cfg)
         cfg->no_reflectors = idx;
     }
 
-    /* OWD thresholds: UCI stores in ms, we store µs */
+    /* OWD thresholds: UCI in ms → µs */
     UCI_MS_US(dl_avg_owd_delta_max_adjust_up_thr_us,   "dl_avg_owd_delta_max_adjust_up_thr_ms");
     UCI_MS_US(ul_avg_owd_delta_max_adjust_up_thr_us,   "ul_avg_owd_delta_max_adjust_up_thr_ms");
     UCI_MS_US(dl_owd_delta_delay_thr_us,               "dl_owd_delta_delay_thr_ms");
@@ -210,50 +241,51 @@ int config_load(const char *section_name, cake_config_t *cfg)
     UCI_MS_US(dl_avg_owd_delta_max_adjust_down_thr_us, "dl_avg_owd_delta_max_adjust_down_thr_ms");
     UCI_MS_US(ul_avg_owd_delta_max_adjust_down_thr_us, "ul_avg_owd_delta_max_adjust_down_thr_ms");
 
-    /* EWMA */
-    UCI_DBL(alpha_baseline_increase, "alpha_baseline_increase");
-    UCI_DBL(alpha_baseline_decrease, "alpha_baseline_decrease");
-    UCI_DBL(alpha_delta_ewma,        "alpha_delta_ewma");
+    /* EWMA alphas: UCI is a plain ratio (e.g. "0.001") → _fp */
+    UCI_FP(alpha_baseline_increase, "alpha_baseline_increase");
+    UCI_FP(alpha_baseline_decrease, "alpha_baseline_decrease");
+    UCI_FP(alpha_delta_ewma,        "alpha_delta_ewma");
 
-    /* Rate multipliers: UCI stores as float (e.g. 0.99), we store *1e6 */
-    UCI_MULT(shaper_rate_min_adjust_down_bufferbloat, "shaper_rate_min_adjust_down_bufferbloat");
-    UCI_MULT(shaper_rate_max_adjust_down_bufferbloat, "shaper_rate_max_adjust_down_bufferbloat");
-    UCI_MULT(shaper_rate_min_adjust_up_load_high,     "shaper_rate_min_adjust_up_load_high");
-    UCI_MULT(shaper_rate_max_adjust_up_load_high,     "shaper_rate_max_adjust_up_load_high");
-    UCI_MULT(shaper_rate_adjust_down_load_low,        "shaper_rate_adjust_down_load_low");
-    UCI_MULT(shaper_rate_adjust_up_load_low,          "shaper_rate_adjust_up_load_low");
+    /* Rate multipliers: UCI is a plain ratio (e.g. "0.99") → _fp */
+    UCI_FP(shaper_rate_min_adjust_down_bufferbloat, "shaper_rate_min_adjust_down_bufferbloat");
+    UCI_FP(shaper_rate_max_adjust_down_bufferbloat, "shaper_rate_max_adjust_down_bufferbloat");
+    UCI_FP(shaper_rate_min_adjust_up_load_high,     "shaper_rate_min_adjust_up_load_high");
+    UCI_FP(shaper_rate_max_adjust_up_load_high,     "shaper_rate_max_adjust_up_load_high");
+    UCI_FP(shaper_rate_adjust_down_load_low,        "shaper_rate_adjust_down_load_low");
+    UCI_FP(shaper_rate_adjust_up_load_low,          "shaper_rate_adjust_up_load_low");
 
     /* Detection */
     UCI_INT(bufferbloat_detection_window, "bufferbloat_detection_window");
     UCI_INT(bufferbloat_detection_thr,    "bufferbloat_detection_thr");
-    UCI_DBL(high_load_thr,                "high_load_thr");
+    UCI_FP (high_load_thr,                "high_load_thr");
 
-    /* Refractory periods: UCI in ms, stored as µs */
+    /* Refractory periods: UCI in ms → µs */
     UCI_MS_US(bufferbloat_refractory_period_us, "bufferbloat_refractory_period_ms");
     UCI_MS_US(decay_refractory_period_us,       "decay_refractory_period_ms");
 
-    /* Reflector health: UCI in seconds, stored as µs */
+    /* Reflector health: UCI in seconds → µs */
     UCI_S_US(reflector_health_check_interval_us,     "reflector_health_check_interval_s");
     UCI_S_US(reflector_response_deadline_us,         "reflector_response_deadline_s");
     UCI_INT (reflector_misbehaving_detection_window, "reflector_misbehaving_detection_window");
     UCI_INT (reflector_misbehaving_detection_thr,    "reflector_misbehaving_detection_thr");
     UCI_S_US(reflector_replacement_interval_us,      "reflector_replacement_interval_s");
     UCI_S_US(reflector_comparison_interval_us,       "reflector_comparison_interval_s");
-    UCI_DBL (reflector_sum_owd_baselines_delta_thr_ms, "reflector_sum_owd_baselines_delta_thr_ms");
-    UCI_DBL (reflector_owd_delta_ewma_delta_thr_ms,    "reflector_owd_delta_ewma_delta_thr_ms");
+    /* Comparison thresholds: UCI in ms → µs */
+    UCI_MS_US(reflector_sum_owd_baselines_delta_thr_us, "reflector_sum_owd_baselines_delta_thr_ms");
+    UCI_MS_US(reflector_owd_delta_ewma_delta_thr_us,    "reflector_owd_delta_ewma_delta_thr_ms");
 
     /* Stall */
-    UCI_INT(stall_detection_thr,           "stall_detection_thr");
-    UCI_U32(connection_stall_thr_kbps,     "connection_stall_thr_kbps");
-    UCI_DBL(global_ping_response_timeout_s,"global_ping_response_timeout_s");
+    UCI_INT  (stall_detection_thr,             "stall_detection_thr");
+    UCI_U32  (connection_stall_thr_kbps,       "connection_stall_thr_kbps");
+    UCI_S_US (global_ping_response_timeout_us, "global_ping_response_timeout_s");
 
     /* Misc */
-    UCI_DBL(sustained_idle_sleep_thr_s,         "sustained_idle_sleep_thr_s");
-    UCI_INT(min_shaper_rates_enforcement,        "min_shaper_rates_enforcement");
-    UCI_INT(enable_sleep_function,               "enable_sleep_function");
-    UCI_DBL(startup_wait_s,                      "startup_wait_s");
-    UCI_MS_US(monitor_achieved_rates_interval_us,"monitor_achieved_rates_interval_ms");
-    UCI_DBL(if_up_check_interval_s,              "if_up_check_interval_s");
+    UCI_S_US (sustained_idle_sleep_thr_us,         "sustained_idle_sleep_thr_s");
+    UCI_INT  (min_shaper_rates_enforcement,         "min_shaper_rates_enforcement");
+    UCI_INT  (enable_sleep_function,                "enable_sleep_function");
+    UCI_S_US (startup_wait_us,                      "startup_wait_s");
+    UCI_MS_US(monitor_achieved_rates_interval_us,   "monitor_achieved_rates_interval_ms");
+    UCI_S_US (if_up_check_interval_us,              "if_up_check_interval_s");
 
     uci_unload(ctx, pkg);
     uci_free_context(ctx);
