@@ -16,7 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         version:
-          - SNAPSHOT  # OpenWrt 25.12 Apk
+          - 25.12.0   # OpenWrt 25.12 Apk
           - 24.10.0   # OpenWrt 24.10 Ipk
         arch:
           # --- High-Performance ARM ---
