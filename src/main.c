@@ -1,13 +1,20 @@
 /*
  * cake-autorate – C rewrite for OpenWrt
  *
- * Core algorithm mirrors cake-autorate.sh:
- *   • ICMP ping via custom pinger
- *   • Rate monitor via /sys/class/net polling
- *   • tc qdisc change for CAKE bandwidth adjustment (fork+exec, no shell)
- *   • uloop for the main event loop, timers, and fd watching
- *   • Reflector health monitoring with automatic replacement
+ * Standalone CAKE autorate daemon: no SQM scripts required.
  *
+ * Lifecycle managed entirely in-process via tc_netlink.c:
+ *   Startup  → tc_dl_setup() + tc_ul_setup()   (creates IFB, qdiscs, filters)
+ *   Runtime  → tc_cake_set_bandwidth()          (adjusts rates in-place)
+ *   Shutdown → tc_dl_teardown() + tc_ul_teardown() (removes all TC objects)
+ *
+ * Algorithm mirrors cake-autorate.sh:
+ *   • ICMP ping via raw IPv4 socket (in-process, no external pinger binary)
+ *     – ping_type 0: ICMP Echo (type 8/0) – RTT/2, symmetric assumption
+ *     – ping_type 1: ICMP Timestamp (type 13/14) – true per-direction OWD
+ *   • Rate monitor via /sys/class/net polling
+ *   • OWD EWMA baseline + delta sliding window for bufferbloat detection
+ *   • Reflector health monitoring with automatic replacement
  */
 
 #include <stdio.h>
@@ -49,6 +56,49 @@
 
 /* Hard cap on the misbehaving-detection window (offences[] array size). */
 #define MAX_OFFENCE_WINDOW 64
+
+/* ────────────────────────────────────────────────────────────── */
+/*  ICMP type 13/14 (Timestamp) definitions                       */
+/* ────────────────────────────────────────────────────────────── */
+
+/* Guard: some older OpenWrt SDK header snapshots omit these. */
+#ifndef ICMP_TIMESTAMP
+#define ICMP_TIMESTAMP      13
+#define ICMP_TIMESTAMPREPLY 14
+#endif
+
+/*
+ * ICMP Timestamp wire format (RFC 792).
+ * All timestamp fields are milliseconds since midnight UT, big-endian.
+ * Follows the standard icmphdr (8 bytes).
+ */
+struct icmp_ts_body {
+    uint32_t originate;  /* sender's transmit time (echoed back by reflector) */
+    uint32_t receive;    /* reflector receive time  (0 in request)             */
+    uint32_t transmit;   /* reflector transmit time (0 in request)             */
+} __attribute__((packed));
+
+/* Milliseconds per day – timestamp wraps at this value */
+#define MS_PER_DAY 86400000UL
+
+/*
+ * PING_SEQ_RING – sequence number ring for correlating type-13 replies.
+ *
+ * For ICMP echo we embed a monotonic timestamp directly in the payload.
+ * For ICMP timestamp the 32-bit originate field holds ms-since-midnight,
+ * which is too coarse and doesn't encode reflector index.  Instead we
+ * store per-sequence metadata here, keyed by (seq % PING_SEQ_RING).
+ *
+ * With pings every ~50 ms and max RTT < 2 s we have ≤40 in-flight pings;
+ * 256 slots provides a comfortable safety margin before wrap collision.
+ */
+#define PING_SEQ_RING 256
+
+typedef struct {
+    int64_t  t_sent_us;      /* monotonic µs at send time (for RTT if needed) */
+    uint32_t originate_ms;   /* ms-since-midnight sent in originate field      */
+    int      reflector_idx;  /* which active reflector this ping was sent to   */
+} ping_seq_slot_t;
 
 /* ────────────────────────────────────────────────────────────── */
 /*  Per-reflector runtime state                                   */
@@ -115,6 +165,9 @@ typedef struct {
     uint16_t          ping_seq;
     int               ping_rr_idx;  /* round-robin reflector index */
 
+    /* Per-sequence state for ICMP timestamp mode (type 13) */
+    ping_seq_slot_t   ping_seq_ring[PING_SEQ_RING];
+
     /* Timers */
     struct uloop_timeout rate_timer;
     struct uloop_timeout health_timer;
@@ -124,6 +177,10 @@ typedef struct {
 
     /* Ping response interval (µs): ping_interval / no_pingers */
     int64_t ping_response_interval_us;
+
+    /* Track whether setup succeeded (for teardown) */
+    int dl_setup_done;
+    int ul_setup_done;
 } autorate_t;
 
 /* ────────────────────────────────────────────────────────────── */
@@ -144,6 +201,129 @@ static void set_nonblocking(int fd)
 }
 
 /* ────────────────────────────────────────────────────────────── */
+/*  Build cake_qdisc_opts_t from config                           */
+/* ────────────────────────────────────────────────────────────── */
+
+/*
+ * make_dl_opts – options for the IFB (download) CAKE qdisc.
+ *
+ *  .ingress = 1  tells CAKE it is on an ingress (IFB) path.
+ *  .wash    = 0  we preserve DSCP on DL so the local stack still
+ *               sees original markings; washing only makes sense UL.
+ */
+static cake_qdisc_opts_t make_dl_opts(const cake_config_t *c)
+{
+    cake_qdisc_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.overhead   = c->cake_overhead;
+    o.mpu        = c->cake_mpu;
+    o.nat        = c->cake_nat;
+    o.wash       = 0;                 /* never wash on DL/IFB */
+    o.ingress    = 1;                 /* always set for IFB   */
+    o.ack_filter = (uint32_t)c->cake_ack_filter;
+    o.diffserv   = (uint32_t)c->cake_diffserv;
+    o.flow_mode  = (uint32_t)c->cake_flow_mode;
+    o.atm        = (uint32_t)c->cake_atm;
+    o.rtt_us     = c->cake_rtt_us;
+    o.split_gso  = (uint32_t)c->cake_split_gso;
+    o.use_cake_mq = (uint32_t)c->cake_mq;
+    return o;
+}
+
+/*
+ * make_ul_opts – options for the WAN (upload) CAKE qdisc.
+ *
+ *  .ingress = 0  normal egress qdisc.
+ *  .wash    = per-config (strip DSCP on UL by default).
+ */
+static cake_qdisc_opts_t make_ul_opts(const cake_config_t *c)
+{
+    cake_qdisc_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.overhead   = c->cake_overhead;
+    o.mpu        = c->cake_mpu;
+    o.nat        = c->cake_nat;
+    o.wash       = (uint32_t)c->cake_wash;
+    o.ingress    = 0;
+    o.ack_filter = (uint32_t)c->cake_ack_filter;
+    o.diffserv   = (uint32_t)c->cake_diffserv;
+    o.flow_mode  = (uint32_t)c->cake_flow_mode;
+    o.atm        = (uint32_t)c->cake_atm;
+    o.rtt_us     = c->cake_rtt_us;
+    o.split_gso  = (uint32_t)c->cake_split_gso;
+    o.use_cake_mq = (uint32_t)c->cake_mq;
+    return o;
+}
+
+/* ────────────────────────────────────────────────────────────── */
+/*  CAKE setup / teardown                                         */
+/* ────────────────────────────────────────────────────────────── */
+
+/*
+ * cake_setup – create the full DL + UL CAKE plumbing.
+ *
+ * DL: IFB created, brought up, CAKE attached, ingress qdisc on WAN,
+ *     match-all mirred redirect filter WAN→IFB.
+ * UL: CAKE root qdisc attached to WAN.
+ *
+ * Sets ar->dl_setup_done / ul_setup_done so teardown knows what to undo.
+ */
+static int cake_setup(autorate_t *ar)
+{
+    cake_config_t *c = &ar->cfg;
+
+    if (c->adjust_dl_shaper_rate && c->dl_if[0]) {
+        cake_qdisc_opts_t dl_opts = make_dl_opts(c);
+        if (tc_dl_setup(ar->tc_nl,
+                        c->ul_if,          /* WAN interface */
+                        c->dl_if,          /* IFB interface */
+                        ar->shaper_rate_kbps[DIR_DL],
+                        &dl_opts) < 0) {
+            syslog(LOG_ERR, "cake_setup: DL path failed: %m");
+            return -1;
+        }
+        ar->dl_setup_done = 1;
+        ar->last_shaper_rate_kbps[DIR_DL] = ar->shaper_rate_kbps[DIR_DL];
+    }
+
+    if (c->adjust_ul_shaper_rate && c->ul_if[0]) {
+        cake_qdisc_opts_t ul_opts = make_ul_opts(c);
+        if (tc_ul_setup(ar->tc_nl,
+                        c->ul_if,
+                        ar->shaper_rate_kbps[DIR_UL],
+                        &ul_opts) < 0) {
+            syslog(LOG_ERR, "cake_setup: UL path failed: %m");
+            return -1;
+        }
+        ar->ul_setup_done = 1;
+        ar->last_shaper_rate_kbps[DIR_UL] = ar->shaper_rate_kbps[DIR_UL];
+    }
+
+    return 0;
+}
+
+/*
+ * cake_teardown – remove all CAKE TC objects created by cake_setup().
+ *
+ * Called on graceful shutdown.  Leaves interfaces in a clean state
+ * without any rate limiting.
+ */
+static void cake_teardown(autorate_t *ar)
+{
+    cake_config_t *c = &ar->cfg;
+
+    if (ar->dl_setup_done) {
+        tc_dl_teardown(ar->tc_nl, c->ul_if, c->dl_if);
+        ar->dl_setup_done = 0;
+    }
+
+    if (ar->ul_setup_done) {
+        tc_ul_teardown(ar->tc_nl, c->ul_if);
+        ar->ul_setup_done = 0;
+    }
+}
+
+/* ────────────────────────────────────────────────────────────── */
 /*  CAKE rate control                                             */
 /* ────────────────────────────────────────────────────────────── */
 static void clamp_shaper_rate(autorate_t *ar, int dir)
@@ -156,10 +336,6 @@ static void clamp_shaper_rate(autorate_t *ar, int dir)
     if (ar->shaper_rate_kbps[dir] > mx) ar->shaper_rate_kbps[dir] = mx;
 }
 
-/*
- * set_shaper_rate – apply the current shaper rate to the kernel.
- * Includes optimization to prevent thrashing on micro-adjustments.
- */
 static void set_shaper_rate(autorate_t *ar, int dir)
 {
     uint32_t rate     = ar->shaper_rate_kbps[dir];
@@ -168,53 +344,29 @@ static void set_shaper_rate(autorate_t *ar, int dir)
     if (rate == old_rate)
         return;
 
-    /*
-     * HYSTERESIS OPTIMIZATION:
-     * Don't fork 'tc' for insignificant changes (< 0.5%) unless we are
-     * hitting the exact min/max limits. This prevents CPU churn.
-     */
-    uint32_t min_limit = (dir == DIR_DL) ? ar->cfg.min_dl_shaper_rate_kbps 
+    /* Hysteresis: skip trivial changes (< 0.5%) unless hitting a rail. */
+    uint32_t min_limit = (dir == DIR_DL) ? ar->cfg.min_dl_shaper_rate_kbps
                                          : ar->cfg.min_ul_shaper_rate_kbps;
-    uint32_t max_limit = (dir == DIR_DL) ? ar->cfg.max_dl_shaper_rate_kbps 
+    uint32_t max_limit = (dir == DIR_DL) ? ar->cfg.max_dl_shaper_rate_kbps
                                          : ar->cfg.max_ul_shaper_rate_kbps;
 
-    // Calculate absolute difference
     uint32_t diff = (rate > old_rate) ? (rate - old_rate) : (old_rate - rate);
-    
-    // Threshold is 0.5% of current rate (e.g., 100kbps at 20Mbps, 1.5Mbps at 300Mbps)
     uint32_t base = old_rate ? old_rate : rate;
-
-    uint32_t threshold = base / 200;            /* 0.5% */
-    uint32_t floor_val = (base < 5000) ? (base / 100) : 50; /* 1% below 5 Mbps */
+    uint32_t threshold = base / 200;
+    uint32_t floor_val = (base < 5000) ? (base / 100) : 50;
     if (threshold < floor_val) threshold = floor_val;
 
-    // If change is small AND we are not snapping to a rail (min/max), skip update
-    if (diff < threshold && rate != min_limit && rate != max_limit) {
+    if (diff < threshold && rate != min_limit && rate != max_limit)
         return;
-    }
 
     const char *iface  = (dir == DIR_DL) ? ar->cfg.dl_if : ar->cfg.ul_if;
     int         adjust = (dir == DIR_DL) ? ar->cfg.adjust_dl_shaper_rate
                                          : ar->cfg.adjust_ul_shaper_rate;
 
-    if (adjust && iface[0] != '\0') {
-        /* tc_cake_set_bandwidth() tries RTM_NEWQDISC/change first,
-         * then falls back to RTM_NEWQDISC/add on ENOENT – identical
-         * semantics to the old two-command approach, but in-process. */
+    if (adjust && iface[0] != '\0')
         tc_cake_set_bandwidth(ar->tc_nl, iface, rate);
-    }
 
     ar->last_shaper_rate_kbps[dir] = rate;
-}
-
-/*
- * reset_shaper_rate – restore unlimited bandwidth on shutdown so the
- * interface is not left permanently throttled.
- */
-static void reset_shaper_rate(autorate_t *ar, const char *iface)
-{
-    /* rate_kbps == 0  →  CAKE rate_bps == 0  →  unlimited */
-    tc_cake_set_bandwidth(ar->tc_nl, iface, 0);
 }
 
 /* ────────────────────────────────────────────────────────────── */
@@ -326,11 +478,6 @@ static void process_owd(autorate_t *ar,
     cake_config_t *c = &ar->cfg;
     reflector_t   *r = &ar->reflectors[reflector_idx];
 
-    /*
-     * Bootstrap: first sample for this reflector (or after replacement).
-     * Set baseline to the observed OWD so the first delta is zero rather
-     * than triggering a spurious bufferbloat event.
-     */
     if (r->dl_owd_baseline_us == 0) {
         r->dl_owd_baseline_us = dl_owd_us;
         r->ul_owd_baseline_us = ul_owd_us;
@@ -338,10 +485,6 @@ static void process_owd(autorate_t *ar,
         return;
     }
 
-    /*
-     * Sanity check: a very large negative delta means the path changed
-     * drastically (e.g. route flip).  Reset baselines.
-     */
     if (dl_owd_us - r->dl_owd_baseline_us < -3000000LL ||
         ul_owd_us - r->ul_owd_baseline_us < -3000000LL) {
         r->dl_owd_baseline_us = dl_owd_us;
@@ -350,10 +493,6 @@ static void process_owd(autorate_t *ar,
         return;
     }
 
-    /*
-     * Asymmetric EWMA baseline update.
-     * alpha fields are stored *1,000,000 (_fp), so no float conversion needed.
-     */
     int64_t dl_alpha = (dl_owd_us > r->dl_owd_baseline_us)
         ? c->alpha_baseline_increase
         : c->alpha_baseline_decrease;
@@ -371,10 +510,8 @@ static void process_owd(autorate_t *ar,
     int64_t dl_delta = dl_owd_us - r->dl_owd_baseline_us;
     int64_t ul_delta = ul_owd_us - r->ul_owd_baseline_us;
 
-    /* EWMA of delta – only while under high load */
     if (ar->load_condition[DIR_DL] == LOAD_HIGH ||
         ar->load_condition[DIR_UL] == LOAD_HIGH) {
-        /* alpha_delta_ewma is stored _fp (*1,000,000) */
         int64_t ae = c->alpha_delta_ewma;
         r->dl_owd_delta_ewma_us =
               ae * dl_delta             / 1000000LL
@@ -384,7 +521,6 @@ static void process_owd(autorate_t *ar,
             + (1000000LL - ae) * r->ul_owd_delta_ewma_us / 1000000LL;
     }
 
-    /* Sliding window for bufferbloat detection */
     int bdw = c->bufferbloat_detection_window;
     int idx = ar->delays_idx;
 
@@ -414,7 +550,6 @@ static void process_owd(autorate_t *ar,
     ar->bufferbloat_detected[DIR_UL] =
         (ar->sum_ul_delays >= c->bufferbloat_detection_thr);
 
-    /* high_load_thr is _fp (*1,000,000): use integer multiply then divide */
     uint32_t high_thr_dl = (uint32_t)((uint64_t)ar->shaper_rate_kbps[DIR_DL]
                                       * (uint64_t)c->high_load_thr / 1000000ULL);
     uint32_t high_thr_ul = (uint32_t)((uint64_t)ar->shaper_rate_kbps[DIR_UL]
@@ -441,7 +576,7 @@ static void process_owd(autorate_t *ar,
 }
 
 /* ────────────────────────────────────────────────────────────── */
-/*  Integrated ICMPv4 pinger (raw socket)                          */
+/*  ICMP pinger – shared helpers                                  */
 /* ────────────────────────────────────────────────────────────── */
 
 #define PING_PAYLOAD_MAGIC 0xCACEB00Bu
@@ -450,15 +585,12 @@ static uint16_t csum16(const void *data, size_t len)
 {
     const uint8_t *p = (const uint8_t *)data;
     uint32_t sum = 0;
-
     while (len > 1) {
         sum += (uint16_t)((p[0] << 8) | p[1]);
-        p += 2;
-        len -= 2;
+        p += 2; len -= 2;
     }
     if (len == 1)
         sum += (uint16_t)(p[0] << 8);
-
     sum = (sum >> 16) + (sum & 0xFFFF);
     sum += (sum >> 16);
     return (uint16_t)~sum;
@@ -466,35 +598,66 @@ static uint16_t csum16(const void *data, size_t len)
 
 static void write_be64(uint8_t out[8], uint64_t v)
 {
-    out[0] = (uint8_t)(v >> 56);
-    out[1] = (uint8_t)(v >> 48);
-    out[2] = (uint8_t)(v >> 40);
-    out[3] = (uint8_t)(v >> 32);
-    out[4] = (uint8_t)(v >> 24);
-    out[5] = (uint8_t)(v >> 16);
-    out[6] = (uint8_t)(v >> 8);
-    out[7] = (uint8_t)(v);
+    out[0]=(uint8_t)(v>>56); out[1]=(uint8_t)(v>>48);
+    out[2]=(uint8_t)(v>>40); out[3]=(uint8_t)(v>>32);
+    out[4]=(uint8_t)(v>>24); out[5]=(uint8_t)(v>>16);
+    out[6]=(uint8_t)(v>> 8); out[7]=(uint8_t)(v);
 }
 
 static uint64_t read_be64(const uint8_t in[8])
 {
-    return ((uint64_t)in[0] << 56) |
-           ((uint64_t)in[1] << 48) |
-           ((uint64_t)in[2] << 40) |
-           ((uint64_t)in[3] << 32) |
-           ((uint64_t)in[4] << 24) |
-           ((uint64_t)in[5] << 16) |
-           ((uint64_t)in[6] << 8)  |
-           ((uint64_t)in[7]);
+    return ((uint64_t)in[0]<<56)|((uint64_t)in[1]<<48)|
+           ((uint64_t)in[2]<<40)|((uint64_t)in[3]<<32)|
+           ((uint64_t)in[4]<<24)|((uint64_t)in[5]<<16)|
+           ((uint64_t)in[6]<< 8)|((uint64_t)in[7]);
 }
 
+/*
+ * ms_since_midnight_realtime – milliseconds since 00:00:00 UTC today.
+ * Used for the ICMP Timestamp originate field (RFC 792).
+ * CLOCK_REALTIME is required because the reflector's timestamps are
+ * also wall-clock based.
+ */
+static uint32_t ms_since_midnight_realtime(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t ms = (uint64_t)ts.tv_sec * 1000ULL
+                + (uint64_t)ts.tv_nsec / 1000000ULL;
+    return (uint32_t)(ms % MS_PER_DAY);
+}
+
+/*
+ * ts_diff_ms – signed difference between two ms-since-midnight values.
+ *
+ * Handles midnight rollover: if the raw difference exceeds ±12 hours,
+ * we assume the day boundary was crossed and correct by ±86400000.
+ * For valid ping RTTs (< a few seconds) this is always correct.
+ */
+static int32_t ts_diff_ms(uint32_t later, uint32_t earlier)
+{
+    int32_t d = (int32_t)((int64_t)later - (int64_t)earlier);
+    if (d >  43200000) d -= (int32_t)MS_PER_DAY;
+    if (d < -43200000) d += (int32_t)MS_PER_DAY;
+    return d;
+}
+
+/* ── ICMP Echo payload (type 8, ping_type 0) ──────────────────
+ *
+ * We embed a magic number and a 64-bit monotonic send timestamp so
+ * that any reply that doesn't carry our payload is silently ignored.
+ * No ring-buffer lookup needed – the timestamp is in the payload.
+ */
 struct ping_payload {
     uint32_t magic_be;
-    uint16_t ridx_be;     /* reflector index (debug/sanity), optional */
+    uint16_t ridx_be;       /* reflector index (sanity check) */
     uint16_t reserved_be;
-    uint8_t  t_sent_be64[8]; /* int64_t timestamp in us, big-endian */
+    uint8_t  t_sent_be64[8];
 } __attribute__((packed));
 
+/* ────────────────────────────────────────────────────────────── */
+/*  ICMP reply callback (handles both type 0 and type 14)         */
+/* ────────────────────────────────────────────────────────────── */
 static void icmp_reply_cb(struct uloop_fd *ufd, unsigned int events)
 {
     (void)events;
@@ -508,62 +671,127 @@ static void icmp_reply_cb(struct uloop_fd *ufd, unsigned int events)
         ssize_t n = recvfrom(ufd->fd, buf, sizeof(buf), 0,
                              (struct sockaddr *)&src, &slen);
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-                return;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
             return;
         }
-        if ((size_t)n < sizeof(struct iphdr))
-            continue;
+        if ((size_t)n < sizeof(struct iphdr)) continue;
 
         struct iphdr *iph = (struct iphdr *)buf;
         int ip_hlen = iph->ihl * 4;
-        if (ip_hlen < 20 || (size_t)n < (size_t)ip_hlen + sizeof(struct icmphdr))
+        if (ip_hlen < 20 ||
+            (size_t)n < (size_t)ip_hlen + sizeof(struct icmphdr))
             continue;
 
         struct icmphdr *icmph = (struct icmphdr *)(buf + ip_hlen);
 
-        if (icmph->type != ICMP_ECHOREPLY)
-            continue;
-
-        if (ntohs(icmph->un.echo.id) != ar->ping_id)
-            continue;
-
-        const uint8_t *payload = (const uint8_t *)(icmph + 1);
-        size_t payload_len = (size_t)n - (size_t)ip_hlen - sizeof(struct icmphdr);
-        if (payload_len < sizeof(struct ping_payload))
-            continue;
-
-        const struct ping_payload *pl = (const struct ping_payload *)payload;
-        if (pl->magic_be != htonl(PING_PAYLOAD_MAGIC))
-            continue;
-
-        uint32_t src_be = src.sin_addr.s_addr;
-
-        int ridx = -1;
-        for (int i = 0; i < ar->no_active_reflectors; i++) {
-            if (ar->reflectors[i].addr_be == src_be) {
-                ridx = i;
-                break;
-            }
-        }
-        if (ridx < 0)
-            continue;
+        /* Filter by our ping ID */
+        if (ntohs(icmph->un.echo.id) != ar->ping_id) continue;
 
         int64_t t_now_us = now_us();
-        int64_t t_sent_us = (int64_t)read_be64(pl->t_sent_be64);
-        int64_t rtt_us = t_now_us - t_sent_us;
-        if (rtt_us <= 0)
-            continue;
 
-        int64_t owd_us = rtt_us / 2;
-        process_owd(ar, ridx, owd_us, owd_us, t_now_us);
+        /* ── ICMP Echo Reply (type 0) – ping_type 0 ─────────── */
+        if (icmph->type == ICMP_ECHOREPLY) {
+
+            const uint8_t *payload = (const uint8_t *)(icmph + 1);
+            size_t plen = (size_t)n - (size_t)ip_hlen - sizeof(*icmph);
+            if (plen < sizeof(struct ping_payload)) continue;
+
+            const struct ping_payload *pl = (const struct ping_payload *)payload;
+            if (pl->magic_be != htonl(PING_PAYLOAD_MAGIC)) continue;
+
+            /* Match reflector by source IP */
+            uint32_t src_be = src.sin_addr.s_addr;
+            int ridx = -1;
+            for (int i = 0; i < ar->no_active_reflectors; i++) {
+                if (ar->reflectors[i].addr_be == src_be) { ridx = i; break; }
+            }
+            if (ridx < 0) continue;
+
+            int64_t t_sent_us = (int64_t)read_be64(pl->t_sent_be64);
+            int64_t rtt_us    = t_now_us - t_sent_us;
+            if (rtt_us <= 0) continue;
+
+            /* RTT/2 – symmetric OWD estimate */
+            int64_t owd_us = rtt_us / 2;
+            process_owd(ar, ridx, owd_us, owd_us, t_now_us);
+        }
+
+        /* ── ICMP Timestamp Reply (type 14) – ping_type 1 ──────
+         *
+         * True per-direction OWD via RFC 792 ICMP Timestamp:
+         *
+         *   T1 = originate_ms  (our clock, ms-since-midnight)
+         *   T2 = receive_ms    (reflector clock, ms-since-midnight)
+         *   T3 = transmit_ms   (reflector clock, ms-since-midnight)
+         *   T4 = local_rx_ms   (our clock, ms-since-midnight NOW)
+         *
+         *   UL raw  = T2 - T1   (absorbs clock offset θ as constant)
+         *   DL raw  = T4 - T3   (absorbs -θ as constant)
+         *
+         * Because we use an asymmetric EWMA baseline that tracks the
+         * running minimum, the constant clock offset cancels when
+         * computing the delta from baseline.  No NTP synchronisation
+         * with the reflector is required.
+         *
+         * If the reflector sets transmit = receive (zero processing
+         * time), T3-T2 = 0 and the calculation degrades gracefully to
+         * RTT/2 split by the measured asymmetry ratio.
+         */
+        else if (icmph->type == ICMP_TIMESTAMPREPLY) {
+
+            size_t ts_body_off = (size_t)ip_hlen + sizeof(*icmph);
+            if ((size_t)n < ts_body_off + sizeof(struct icmp_ts_body)) continue;
+
+            const struct icmp_ts_body *tsb =
+                (const struct icmp_ts_body *)(buf + ts_body_off);
+
+            uint16_t seq = ntohs(icmph->un.echo.sequence);
+            ping_seq_slot_t *slot = &ar->ping_seq_ring[seq % PING_SEQ_RING];
+
+            /* Validate that this reply matches the slot we stored */
+            if (slot->reflector_idx < 0 || slot->t_sent_us == 0) continue;
+
+            /* Verify source IP matches what we expected for this slot */
+            int ridx = slot->reflector_idx;
+            if (ridx >= ar->no_active_reflectors ||
+                ar->reflectors[ridx].addr_be != src.sin_addr.s_addr)
+                continue;
+
+            uint32_t orig_ms   = slot->originate_ms;
+            uint32_t recv_ms   = ntohl(tsb->receive);
+            uint32_t tx_ms     = ntohl(tsb->transmit);
+            uint32_t local_ms  = ms_since_midnight_realtime();
+
+            /*
+             * Sanity: reject if receive < originate by more than 5 s
+             * (would imply clocks are wildly out of sync or the reflector
+             * is broken).  A 5 second tolerance covers any reasonable RTT.
+             */
+            int32_t ul_ms = ts_diff_ms(recv_ms, orig_ms);
+            int32_t dl_ms = ts_diff_ms(local_ms, tx_ms);
+
+            if (ul_ms < -5000 || ul_ms > 30000) continue;
+            if (dl_ms < -5000 || dl_ms > 30000) continue;
+
+            int64_t ul_owd_us = (int64_t)ul_ms * 1000LL;
+            int64_t dl_owd_us = (int64_t)dl_ms * 1000LL;
+
+            /* Consume slot so stale replies don't double-count */
+            slot->t_sent_us    = 0;
+            slot->reflector_idx = -1;
+
+            process_owd(ar, ridx, dl_owd_us, ul_owd_us, t_now_us);
+        }
     }
 }
 
+/* ────────────────────────────────────────────────────────────── */
+/*  Ping timer callback – send one ping (echo or timestamp)       */
+/* ────────────────────────────────────────────────────────────── */
 static void ping_timer_cb(struct uloop_timeout *t)
 {
-    autorate_t *ar = container_of(t, autorate_t, ping_timer);
-    cake_config_t *c = &ar->cfg;
+    autorate_t    *ar = container_of(t, autorate_t, ping_timer);
+    cake_config_t *c  = &ar->cfg;
 
     if (ar->no_active_reflectors <= 0 || ar->icmp_sock < 0) {
         uloop_timeout_set(&ar->ping_timer, 1000);
@@ -576,46 +804,78 @@ static void ping_timer_cb(struct uloop_timeout *t)
     int ridx = ar->ping_rr_idx++;
     reflector_t *r = &ar->reflectors[ridx];
 
-    if (r->addr_be == 0) {
-        /* skip invalid address */
-        goto out;
-    }
+    if (r->addr_be == 0) goto out;
 
     struct sockaddr_in dst;
     memset(&dst, 0, sizeof(dst));
-    dst.sin_family = AF_INET;
+    dst.sin_family      = AF_INET;
     dst.sin_addr.s_addr = r->addr_be;
 
-    uint8_t pkt[sizeof(struct icmphdr) + sizeof(struct ping_payload)];
-    memset(pkt, 0, sizeof(pkt));
+    uint16_t seq = ++ar->ping_seq;
+    int64_t  t_sent_us = now_us();
 
-    struct icmphdr *icmph = (struct icmphdr *)pkt;
-    struct ping_payload *pl = (struct ping_payload *)(icmph + 1);
+    if (c->ping_type == 1) {
+        /* ── ICMP Timestamp Request (type 13) ────────────────── */
+        uint8_t pkt[sizeof(struct icmphdr) + sizeof(struct icmp_ts_body)];
+        memset(pkt, 0, sizeof(pkt));
 
-    icmph->type = ICMP_ECHO;
-    icmph->code = 0;
-    icmph->un.echo.id = htons(ar->ping_id);
-    icmph->un.echo.sequence = htons(++ar->ping_seq);
+        struct icmphdr      *h   = (struct icmphdr *)pkt;
+        struct icmp_ts_body *tsb = (struct icmp_ts_body *)(h + 1);
 
-    pl->magic_be = htonl(PING_PAYLOAD_MAGIC);
-    pl->ridx_be  = htons((uint16_t)ridx);
-    pl->reserved_be = 0;
+        h->type               = ICMP_TIMESTAMP;
+        h->code               = 0;
+        h->un.echo.id         = htons(ar->ping_id);
+        h->un.echo.sequence   = htons(seq);
 
-    int64_t t_sent_us = now_us();
-    write_be64(pl->t_sent_be64, (uint64_t)t_sent_us);
+        uint32_t orig_ms = ms_since_midnight_realtime();
+        tsb->originate = htonl(orig_ms);
+        tsb->receive   = 0;
+        tsb->transmit  = 0;
 
-    icmph->checksum = 0;
-    icmph->checksum = csum16(pkt, sizeof(pkt));
+        h->checksum = 0;
+        h->checksum = csum16(pkt, sizeof(pkt));
 
-    (void)sendto(ar->icmp_sock, pkt, sizeof(pkt), 0,
-                 (struct sockaddr *)&dst, sizeof(dst));
+        /* Store in ring for reply correlation */
+        ping_seq_slot_t *slot = &ar->ping_seq_ring[seq % PING_SEQ_RING];
+        slot->t_sent_us     = t_sent_us;
+        slot->originate_ms  = orig_ms;
+        slot->reflector_idx = ridx;
+
+        (void)sendto(ar->icmp_sock, pkt, sizeof(pkt), 0,
+                     (struct sockaddr *)&dst, sizeof(dst));
+
+    } else {
+        /* ── ICMP Echo Request (type 8) ──────────────────────── */
+        uint8_t pkt[sizeof(struct icmphdr) + sizeof(struct ping_payload)];
+        memset(pkt, 0, sizeof(pkt));
+
+        struct icmphdr      *h  = (struct icmphdr *)pkt;
+        struct ping_payload *pl = (struct ping_payload *)(h + 1);
+
+        h->type             = ICMP_ECHO;
+        h->code             = 0;
+        h->un.echo.id       = htons(ar->ping_id);
+        h->un.echo.sequence = htons(seq);
+
+        pl->magic_be    = htonl(PING_PAYLOAD_MAGIC);
+        pl->ridx_be     = htons((uint16_t)ridx);
+        pl->reserved_be = 0;
+        write_be64(pl->t_sent_be64, (uint64_t)t_sent_us);
+
+        h->checksum = 0;
+        h->checksum = csum16(pkt, sizeof(pkt));
+
+        (void)sendto(ar->icmp_sock, pkt, sizeof(pkt), 0,
+                     (struct sockaddr *)&dst, sizeof(dst));
+    }
 
 out:
-    /* reflector_ping_interval_us is already in µs; integer division only */
-    int interval_ms = (int)((c->reflector_ping_interval_us / 1000)
-                            / ar->no_active_reflectors);
-    if (interval_ms < 10) interval_ms = 10; /* minimum 10 ms */
-    uloop_timeout_set(&ar->ping_timer, interval_ms);
+    {
+        int interval_ms = (int)((c->reflector_ping_interval_us / 1000)
+                                / ar->no_active_reflectors);
+        if (interval_ms < 10) interval_ms = 10;
+        uloop_timeout_set(&ar->ping_timer, interval_ms);
+    }
 }
 
 static void refresh_reflector_addrs(autorate_t *ar)
@@ -641,9 +901,15 @@ static int start_pinger(autorate_t *ar)
     ar->icmp_ufd.cb = icmp_reply_cb;
     uloop_fd_add(&ar->icmp_ufd, ULOOP_READ | ULOOP_EDGE_TRIGGER);
 
-    ar->ping_id = (uint16_t)(getpid() ^ ((uint16_t)time(NULL)));
-    ar->ping_seq = 0;
+    ar->ping_id     = (uint16_t)(getpid() ^ ((uint16_t)time(NULL)));
+    ar->ping_seq    = 0;
     ar->ping_rr_idx = 0;
+
+    /* Mark all ring slots as unused */
+    for (int i = 0; i < PING_SEQ_RING; i++) {
+        ar->ping_seq_ring[i].t_sent_us     = 0;
+        ar->ping_seq_ring[i].reflector_idx = -1;
+    }
 
     refresh_reflector_addrs(ar);
 
@@ -665,7 +931,6 @@ static void stop_pinger(autorate_t *ar)
     }
 }
 
-
 /* ────────────────────────────────────────────────────────────── */
 /*  Reflector health check timer                                  */
 /* ────────────────────────────────────────────────────────────── */
@@ -677,14 +942,12 @@ static void health_timer_cb(struct uloop_timeout *t)
     int            win = c->reflector_misbehaving_detection_window;
     int            replaced = 0;
 
-    /* Clamp window to the allocated offences[] array. */
     if (win <= 0 || win > MAX_OFFENCE_WINDOW)
         win = MAX_OFFENCE_WINDOW;
 
     for (int i = 0; i < ar->no_active_reflectors; i++) {
         reflector_t *r = &ar->reflectors[i];
 
-        /* Skip reflectors that haven't received even one response yet. */
         if (r->last_response_us == 0)
             continue;
 
@@ -692,10 +955,10 @@ static void health_timer_cb(struct uloop_timeout *t)
                        c->reflector_response_deadline_us) ? 1 : 0;
 
         int widx = r->offences_idx;
-        r->sum_offences      -= r->offences[widx];
-        r->offences[widx]     = offence;
-        r->sum_offences      += offence;
-        r->offences_idx       = (widx + 1) % win;
+        r->sum_offences  -= r->offences[widx];
+        r->offences[widx] = offence;
+        r->sum_offences  += offence;
+        r->offences_idx   = (widx + 1) % win;
 
         if (r->sum_offences >= c->reflector_misbehaving_detection_thr &&
             ar->spare_idx   <  c->no_reflectors) {
@@ -703,14 +966,12 @@ static void health_timer_cb(struct uloop_timeout *t)
             syslog(LOG_WARNING,
                    "replacing misbehaving reflector %s with %s "
                    "(%d/%d misses in window)",
-                   r->addr,
-                   c->reflectors[ar->spare_idx],
+                   r->addr, c->reflectors[ar->spare_idx],
                    r->sum_offences, win);
 
             snprintf(r->addr, sizeof(r->addr),
                      "%s", c->reflectors[ar->spare_idx++]);
 
-            /* Reset all state for the new reflector. */
             r->dl_owd_baseline_us   = 0;
             r->ul_owd_baseline_us   = 0;
             r->dl_owd_delta_ewma_us = 0;
@@ -723,9 +984,8 @@ static void health_timer_cb(struct uloop_timeout *t)
         }
     }
 
-    if (replaced) {
+    if (replaced)
         refresh_reflector_addrs(ar);
-    }
 
     uloop_timeout_set(t, (int)(c->reflector_health_check_interval_us / 1000));
 }
@@ -735,8 +995,8 @@ static void health_timer_cb(struct uloop_timeout *t)
 /* ────────────────────────────────────────────────────────────── */
 static void rate_timer_cb(struct uloop_timeout *t)
 {
-    autorate_t    *ar  = container_of(t, autorate_t, rate_timer);
-    cake_config_t *c   = &ar->cfg;
+    autorate_t    *ar = container_of(t, autorate_t, rate_timer);
+    cake_config_t *c  = &ar->cfg;
 
     int64_t elapsed = rate_monitor_update(&ar->rm,
                                           &ar->achieved_rate_kbps[DIR_DL],
@@ -745,12 +1005,7 @@ static void rate_timer_cb(struct uloop_timeout *t)
     ar->achieved_rate_updated[DIR_DL] = 1;
     ar->achieved_rate_updated[DIR_UL] = 1;
 
-    /*
-     * Drift compensation: if the timer fired late (elapsed > target),
-     * subtract the excess from the next interval so we stay on schedule
-     * on average.  Clamp to the nominal interval so we never schedule
-     * an instant (0 ms) or negative timer.
-     */
+    /* Drift compensation */
     int64_t target = c->monitor_achieved_rates_interval_us;
     int64_t next   = target - (elapsed - target);
     if (next < target) next = target;
@@ -811,7 +1066,9 @@ int main(int argc, char *argv[])
 
     autorate_t ar;
     memset(&ar, 0, sizeof(ar));
+    ar.icmp_sock = -1;
 
+    /* ── Load configuration ──────────────────────────────────── */
     if (config_load(section, &ar.cfg) < 0) {
         fprintf(stderr, "cake-autorate: failed to load UCI config '%s'\n",
                 section);
@@ -829,15 +1086,13 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    /* ── Allocate OWD sliding windows ────────────────────────── */
     if (init_windows(&ar) < 0) {
         syslog(LOG_ERR, "out of memory allocating OWD windows");
         return 1;
     }
 
-    /*
-     * Active reflectors = first min(no_pingers, no_reflectors) entries.
-     * Spare reflectors start at index spare_idx.
-     */
+    /* Active reflectors = first min(no_pingers, no_reflectors) entries. */
     ar.no_active_reflectors =
         (ar.cfg.no_pingers < ar.cfg.no_reflectors)
         ? ar.cfg.no_pingers
@@ -851,82 +1106,75 @@ int main(int argc, char *argv[])
     ar.shaper_rate_kbps[DIR_DL] = ar.cfg.base_dl_shaper_rate_kbps;
     ar.shaper_rate_kbps[DIR_UL] = ar.cfg.base_ul_shaper_rate_kbps;
 
-    /* Force the initial tc call by making last != current */
-    ar.last_shaper_rate_kbps[DIR_DL] = 0;
-    ar.last_shaper_rate_kbps[DIR_UL] = 0;
-
-    /* reflector_ping_interval_us is already in µs */
     ar.ping_response_interval_us =
-        ar.cfg.reflector_ping_interval_us
-        / ar.no_active_reflectors;
+        ar.cfg.reflector_ping_interval_us / ar.no_active_reflectors;
 
-    /* Open persistent NETLINK_ROUTE socket for CAKE bandwidth control */
+    /* ── Open netlink socket ─────────────────────────────────── */
     ar.tc_nl = tc_nl_open();
     if (!ar.tc_nl) {
         syslog(LOG_ERR, "tc_netlink: failed to open netlink socket");
-        rate_monitor_cleanup(&ar.rm);
-        return 1;
+        goto err_free_windows;
     }
 
-    /* Apply initial CAKE rates */
-    set_shaper_rate(&ar, DIR_DL);
-    set_shaper_rate(&ar, DIR_UL);
+    /* ── Create CAKE qdiscs (replaces SQM script) ────────────── */
+    if (cake_setup(&ar) < 0) {
+        syslog(LOG_ERR, "CAKE setup failed – check interface names and permissions");
+        goto err_tc_close;
+    }
 
-    /* Initialise rate monitor */
-    rate_monitor_init(&ar.rm, ar.cfg.dl_if, ar.cfg.ul_if);
-
-    /* Startup wait */
+    /* ── Startup wait ────────────────────────────────────────── */
     if (ar.cfg.startup_wait_us > 0)
         usleep((unsigned int)ar.cfg.startup_wait_us);
 
-    /* uloop */
+    /* ── Initialise rate monitor ─────────────────────────────── */
+    rate_monitor_init(&ar.rm, ar.cfg.dl_if, ar.cfg.ul_if);
+
+    /* ── uloop event loop ────────────────────────────────────── */
     uloop_init();
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
 
-    /* Start integrated pinger */
     if (start_pinger(&ar) < 0) {
         syslog(LOG_ERR, "failed to start integrated pinger (raw ICMP)");
-        rate_monitor_cleanup(&ar.rm);
-        return 1;
+        goto err_teardown;
     }
 
-    /* Rate-monitor timer */
     ar.rate_timer.cb = rate_timer_cb;
     uloop_timeout_set(&ar.rate_timer,
         (int)(ar.cfg.monitor_achieved_rates_interval_us / 1000));
 
-    /* Reflector health timer */
     ar.health_timer.cb = health_timer_cb;
     uloop_timeout_set(&ar.health_timer,
         (int)(ar.cfg.reflector_health_check_interval_us / 1000));
 
-    syslog(LOG_INFO, "started instance '%s' dl=%s ul=%s",
-           section, ar.cfg.dl_if, ar.cfg.ul_if);
+    syslog(LOG_INFO, "started instance '%s' dl=%s ul=%s ping_type=%s",
+           section, ar.cfg.dl_if, ar.cfg.ul_if,
+           ar.cfg.ping_type == 1 ? "ICMP-timestamp(13)" : "ICMP-echo(8)");
 
     uloop_run();
     uloop_done();
 
-    /* ── Graceful shutdown ─────────────────────────────────── */
+    /* ── Graceful shutdown ───────────────────────────────────── */
     syslog(LOG_INFO, "shutting down instance '%s'", section);
 
     uloop_timeout_cancel(&ar.rate_timer);
     uloop_timeout_cancel(&ar.health_timer);
-
     stop_pinger(&ar);
 
-    /* Restore unlimited bandwidth so the interface is not throttled
-     * after we exit. */
-    if (ar.cfg.adjust_dl_shaper_rate && ar.cfg.dl_if[0])
-        reset_shaper_rate(&ar, ar.cfg.dl_if);
-    if (ar.cfg.adjust_ul_shaper_rate && ar.cfg.ul_if[0])
-        reset_shaper_rate(&ar, ar.cfg.ul_if);
+err_teardown:
+    /*
+     * Remove all CAKE TC objects we created.
+     * This leaves the interfaces clean (no rate limiting) after exit.
+     */
+    cake_teardown(&ar);
 
+err_tc_close:
     tc_nl_close(ar.tc_nl);
     ar.tc_nl = NULL;
 
     rate_monitor_cleanup(&ar.rm);
 
+err_free_windows:
     free(ar.dl_delays);
     free(ar.ul_delays);
     free(ar.dl_owd_deltas_us);

@@ -1,0 +1,26 @@
+CC      ?= gcc
+CFLAGS  ?= -O2 -pipe -Wall -Wextra -std=c11
+LDFLAGS ?= -lubox -luci
+
+SRCS = main.c config.c rate_monitor.c tc_netlink.c
+OBJS = $(SRCS:.c=.o)
+BIN  = cake-autorate-reborn
+
+.PHONY: all clean
+
+all: $(BIN)
+
+$(BIN): $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+clean:
+	rm -f $(OBJS) $(BIN)
+
+# Header dependencies
+main.o:         main.c config.h rate_monitor.h tc_netlink.h
+config.o:       config.c config.h tc_netlink.h
+rate_monitor.o: rate_monitor.c rate_monitor.h
+tc_netlink.o:   tc_netlink.c tc_netlink.h
