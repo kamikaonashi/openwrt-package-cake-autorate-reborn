@@ -1,11 +1,18 @@
 {
     "luci-app-cake-autorate-reborn": {
-        "description": "Grant UCI access for luci-app-cake-autorate-reborn",
+        "description": "Grant access for luci-app-cake-autorate-reborn",
         "read": {
-            "uci": [ "cake_autorate_reborn" ]
+            "uci": [ "cake_autorate_reborn" ],
+            "ubus": {
+                "service": [ "list" ],
+                "luci": [ "getInitList", "getInitStatus", "setInitAction" ]
+            }
         },
         "write": {
-            "uci": [ "cake_autorate_reborn" ]
+            "uci": [ "cake_autorate_reborn" ],
+            "ubus": {
+                "luci": [ "setInitAction" ]
+            }
         }
     }
 }

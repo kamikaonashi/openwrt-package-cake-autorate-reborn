@@ -3,6 +3,8 @@ config cake_autorate_reborn 'primary'
     option enabled '0'
 
     # ── Interfaces ───────────────────────────────────────────
+    # dl_if: IFB interface for shaped ingress (created automatically at startup)
+    # ul_if: WAN-facing interface for egress shaping
     option dl_if 'ifb-wan'
     option ul_if 'wan'
     option adjust_dl_shaper_rate '1'
@@ -84,3 +86,99 @@ config cake_autorate_reborn 'primary'
     option startup_wait_s                     '0.0'
     option monitor_achieved_rates_interval_ms '200'
     option if_up_check_interval_s             '10.0'
+
+    # ── Pinger mode ─────────────────────────────────────────
+    # ping_type: ICMP packet type used for OWD measurement.
+    #
+    #   0 = ICMP Echo (type 8/0)  – default
+    #       Measures RTT; OWD estimated as RTT/2.
+    #       Works against any host that responds to ping.
+    #       Assumes symmetric path – underestimates OWD asymmetry.
+    #
+    #   1 = ICMP Timestamp (type 13/14)
+    #       Returns true per-direction OWD from reflector timestamps.
+    #       More accurate for asymmetric broadband (DSL, cable, DOCSIS).
+    #       Requires reflectors that support ICMP timestamp replies.
+    #       Recommended reflector list:
+    #         https://github.com/tievolu/timestamp-reflectors
+    option ping_type '0'
+
+    # reflectors_file: path to a plain-text file of reflector IP addresses,
+    # one per line (lines starting with '#' are ignored).
+    # When set, overrides the 'reflectors' list above.
+    # The daemon shuffles the list on each startup for reflector diversity.
+    # Leave blank to use the list above.
+    #
+    # Example:
+    #   option reflectors_file '/etc/cake-autorate/timestamp-reflectors.txt'
+    option reflectors_file ''
+
+    # ── CAKE qdisc options ───────────────────────────────────
+    # These are applied when the daemon creates the CAKE qdiscs at startup.
+    # No sqm-scripts required; the daemon manages the full IFB+CAKE plumbing.
+
+    # overhead: per-packet byte overhead for rate accounting.
+    #   0  = none (Ethernet / plain PPPoE-PTM)
+    #   8  = PPPoE over PTM/VDSL2
+    #   18 = PPPoE over ATM/ADSL (LLC/SNAP)
+    option cake_overhead '0'
+
+    # mpu: minimum packet unit in bytes (0 = CAKE default, no padding)
+    option cake_mpu '0'
+
+    # nat: NAT-aware flow hashing — strongly recommended for home routers
+    #   1 = enabled (default), 0 = disabled
+    option cake_nat '1'
+
+    # wash: strip DSCP/ECN markings on egress (applied to UL only)
+    #   1 = enabled (default), 0 = disabled
+    option cake_wash '1'
+
+    # ack_filter: suppress redundant TCP ACKs to reclaim UL capacity
+    #   0 = off (default, safest)
+    #   1 = moderate filtering
+    #   2 = aggressive
+    option cake_ack_filter '0'
+
+    # diffserv: tin / traffic classification structure
+    #   1 = diffserv4  – 4 tins: bulk / best-effort / streaming / voice (default)
+    #   2 = diffserv8  – 8 tins mapped to CS0–CS7
+    #   3 = besteffort – single tin (no prioritisation)
+    #   4 = precedence – legacy IP Precedence field
+    option cake_diffserv '1'
+
+    # flow_mode: per-flow / per-host isolation
+    #   7 = triple (default) – isolates by src host, dst host, and 5-tuple flow
+    #   5 = dual-srchost     – src host + flow
+    #   6 = dual-dsthost     – dst host + flow
+    #   3 = hosts            – src+dst host pair only
+    #   4 = flows            – 5-tuple flow only
+    option cake_flow_mode '7'
+
+    # atm: ATM/PTM cell-size compensation
+    #   0 = none (default)
+    #   1 = ATM  – 48-byte cell rounding (ADSL)
+    #   2 = PTM  – 64-byte expansion (VDSL2 alternative to overhead 8)
+    option cake_atm '0'
+
+    # rtt_ms: CAKE AQM target RTT in milliseconds (0 = CAKE default = 100 ms)
+    option cake_rtt_ms '0'
+
+    # split_gso: split GSO super-packets before scheduling (recommended)
+    #   1 = enabled (default), 0 = disabled
+    option cake_split_gso '1'
+
+    # ── cake-mq (OpenWrt 25.12+) ─────────────────────────────
+    # cake_mq: use the multi-queue CAKE variant for improved multi-core
+    # throughput on routers with ≥2 CPU cores (Filogic, IPQ807x, etc.).
+    #
+    # Requirements:
+    #   - OpenWrt 25.12 or later
+    #   - kmod-sched-cake-mq package installed
+    #
+    # The daemon automatically falls back to standard CAKE if the
+    # kmod-sched-cake-mq module is not loaded.
+    #
+    #   0 = standard CAKE  (default; works on all hardware)
+    #   1 = cake-mq        (OpenWrt 25.12+, multi-core benefit)
+    option cake_mq '0'
