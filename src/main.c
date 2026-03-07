@@ -76,7 +76,7 @@ struct icmp_ts_body {
     uint32_t originate;  /* sender's transmit time (echoed back by reflector) */
     uint32_t receive;    /* reflector receive time  (0 in request)             */
     uint32_t transmit;   /* reflector transmit time (0 in request)             */
-} __attribute__((packed));
+};
 
 /* Milliseconds per day – timestamp wraps at this value */
 #define MS_PER_DAY 86400000UL
@@ -581,16 +581,22 @@ static void process_owd(autorate_t *ar,
 
 #define PING_PAYLOAD_MAGIC 0xCACEB00Bu
 
+/*
+ * csum16 – RFC 1071 Internet checksum.
+ */
 static uint16_t csum16(const void *data, size_t len)
 {
-    const uint8_t *p = (const uint8_t *)data;
+    const uint16_t *word = (const uint16_t *)data;
     uint32_t sum = 0;
     while (len > 1) {
-        sum += (uint16_t)((p[0] << 8) | p[1]);
-        p += 2; len -= 2;
+        sum += *word++;
+        len -= 2;
     }
-    if (len == 1)
-        sum += (uint16_t)(p[0] << 8);
+    if (len == 1) {
+        uint16_t last = 0;
+        *(uint8_t *)&last = *(const uint8_t *)word;
+        sum += last;
+    }
     sum = (sum >> 16) + (sum & 0xFFFF);
     sum += (sum >> 16);
     return (uint16_t)~sum;
@@ -653,7 +659,7 @@ struct ping_payload {
     uint16_t ridx_be;       /* reflector index (sanity check) */
     uint16_t reserved_be;
     uint8_t  t_sent_be64[8];
-} __attribute__((packed));
+};
 
 /* ────────────────────────────────────────────────────────────── */
 /*  ICMP reply callback (handles both type 0 and type 14)         */
@@ -664,7 +670,7 @@ static void icmp_reply_cb(struct uloop_fd *ufd, unsigned int events)
     autorate_t *ar = container_of(ufd, autorate_t, icmp_ufd);
 
     for (;;) {
-        uint8_t buf[512];
+        uint8_t buf[1500];  /* full Ethernet MTU – prevents silent truncation */
         struct sockaddr_in src;
         socklen_t slen = sizeof(src);
 
@@ -1183,7 +1189,7 @@ int main(int argc, char *argv[])
     /* ── Create CAKE qdiscs (replaces SQM script) ────────────── */
     if (cake_setup(&ar) < 0) {
         syslog(LOG_ERR, "CAKE setup failed – check interface names and permissions");
-        goto err_tc_close;
+        goto err_teardown;  /* runs cake_teardown() to clean up partial DL setup */
     }
 
     /* ── Startup wait ────────────────────────────────────────── */
